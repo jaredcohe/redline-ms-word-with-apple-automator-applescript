@@ -35,17 +35,12 @@ on run {input, parameters}
 	
 	-- Strip extension properly and validate
 	set revNameNoExt to my stripExtension(revName)
-	log "Filename without extension: '" & revNameNoExt & "'"
 	
-	-- Safety check: if empty or starts with dot, use original name
 	if revNameNoExt is "" or revNameNoExt starts with "." then
 		set revNameNoExt to "comparison"
-		log "WARNING: Invalid filename, using 'comparison' instead"
 	end if
 	
 	set outName to revNameNoExt & ".redline.docx"
-	log "Output filename: " & outName
-	
 	set tempOutPOSIX to desktopPOSIX & outName
 	set finalOutPOSIX to directoryPath & outName
 	
@@ -53,16 +48,66 @@ on run {input, parameters}
 	do shell script "cp " & quoted form of (POSIX path of origAlias) & " " & quoted form of tempOrigPOSIX
 	do shell script "cp " & quoted form of revPOSIX & " " & quoted form of tempRevPOSIX
 	
+	-- Wait for files to be fully written
+	delay 2
+	
+	-- Verify files exist and are readable
+	do shell script "ls -la " & quoted form of tempOrigPOSIX
+	do shell script "ls -la " & quoted form of tempRevPOSIX
+	
+	-- Quit Word completely first, then restart
+	tell application "Microsoft Word"
+		quit
+	end tell
+	
+	delay 2
+	
 	tell application "Microsoft Word"
 		activate
+		delay 1
 		
-		-- Open documents from Desktop
+		-- Open both documents to accept all tracked changes
 		set origDoc to open file name tempOrigPOSIX
+		delay 1
+		set revDoc to open file name tempRevPOSIX
+		delay 1
 		
-		-- Compare
-		compare origDoc path tempRevPOSIX
+		-- Accept all tracked changes in both documents
+		try
+			tell origDoc
+				accept all revisions
+			end tell
+		end try
 		
-		delay 2
+		try
+			tell revDoc
+				accept all revisions
+			end tell
+		end try
+		
+		delay 1
+		
+		-- Save both documents with changes accepted
+		save origDoc
+		save revDoc
+		
+		-- Close the revised document (compare will reopen it)
+		close revDoc saving no
+		
+		delay 1
+		
+		-- Try the compare
+		try
+			compare origDoc path tempRevPOSIX
+		on error errMsg
+			display dialog "Compare failed: " & errMsg & return & return & "Files: " & return & origName & return & revName
+			close every document saving no
+			do shell script "rm " & quoted form of tempOrigPOSIX
+			do shell script "rm " & quoted form of tempRevPOSIX
+			return input
+		end try
+		
+		delay 5
 		
 		-- Get the comparison document
 		set compDoc to active document
@@ -80,7 +125,7 @@ on run {input, parameters}
 	do shell script "rm " & quoted form of tempOrigPOSIX
 	do shell script "rm " & quoted form of tempRevPOSIX
 	
-	-- Use Finder to move file to Google Drive
+	-- Use Finder to move file to target location
 	tell application "Finder"
 		set sourceFile to POSIX file tempOutPOSIX as alias
 		set targetFolder to POSIX file directoryPath as alias
@@ -94,30 +139,25 @@ end run
 on stripExtension(fileName)
 	set oldDelims to AppleScript's text item delimiters
 	
-	-- Handle edge cases
 	if fileName is "" then
 		set AppleScript's text item delimiters to oldDelims
 		return ""
 	end if
 	
-	-- If no dot, return as-is
 	if fileName does not contain "." then
 		set AppleScript's text item delimiters to oldDelims
 		return fileName
 	end if
 	
-	-- Split on dots
 	set AppleScript's text item delimiters to "."
 	set nameItems to text items of fileName
 	set itemCount to count of nameItems
 	
-	-- If filename starts with dot (like .hidden), return as-is
 	if itemCount is 2 and item 1 of nameItems is "" then
 		set AppleScript's text item delimiters to oldDelims
 		return fileName
 	end if
 	
-	-- Take all items except the last one (the extension)
 	if itemCount > 1 then
 		set resultItems to items 1 thru (itemCount - 1) of nameItems
 		set AppleScript's text item delimiters to "."
