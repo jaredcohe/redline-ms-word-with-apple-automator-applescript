@@ -1,0 +1,396 @@
+on run {input, parameters}
+	-- Validate exactly 2 files selected
+	if (count of input) is not 2 then
+		display dialog "Please select exactly two Word documents." buttons {"OK"} default button 1 with icon stop
+		return input
+	end if
+
+	set origAlias to item 1 of input as alias
+	set revAlias to item 2 of input as alias
+
+	set origName to name of (info for origAlias)
+	set revName to name of (info for revAlias)
+
+	-- Validate file extensions
+	set validExts to {"docx", "doc", "docm"}
+	if my getExtension(origName) is not in validExts then
+		display dialog origName & " is not a Word document (.docx/.doc/.docm)" buttons {"OK"} default button 1 with icon stop
+		return input
+	end if
+	if my getExtension(revName) is not in validExts then
+		display dialog revName & " is not a Word document (.docx/.doc/.docm)" buttons {"OK"} default button 1 with icon stop
+		return input
+	end if
+
+	-- Paths
+	set origPOSIX to POSIX path of origAlias
+	set revPOSIX to POSIX path of revAlias
+	set directoryPath to my parentDirPOSIX(revPOSIX)
+
+	-- Output name
+	set revNameNoExt to my stripExtension(revName)
+	if revNameNoExt is "" or revNameNoExt starts with "." then set revNameNoExt to "comparison"
+	set outName to revNameNoExt & ".redline.docx"
+	set finalOutPOSIX to directoryPath & outName
+
+	-- Temp files always go on the Desktop — Word has clean, sandbox-safe access there
+	-- and Desktop paths have no spaces or special characters that break Word's compare.
+	-- (Source files may be on Google Drive whose POSIX paths contain @ and spaces.)
+	set tempOrigName to ".__rltmp_orig.docx"
+	set tempOrigPOSIX to POSIX path of (path to desktop) & tempOrigName
+	set tempRevName to ".__rltmp_rev.docx"
+	set tempRevPOSIX to POSIX path of (path to desktop) & tempRevName
+
+	display notification "Comparing " & origName & " with " & revName with title "Redline" subtitle "Starting..."
+
+	set wordWasRunning to application "Microsoft Word" is running
+
+	-- origDocName captured inside try; declared here so error handler can reference it
+	set origDocName to ""
+	set currentStage to "starting"
+
+	try
+		-- Suppress Word dialogs immediately — before any Apple Events open calls
+		set currentStage to "suppressing Word dialogs"
+			tell application "Microsoft Word"
+				set display alerts to alerts none
+				try
+					close document outName saving no
+				end try
+				try
+					close document tempOrigName saving no
+				end try
+				try
+					close document tempRevName saving no
+				end try
+			end tell
+
+		-- Open each original in Word to force Google Drive to download it to local disk,
+		-- then close it. Files stored cloud-only aren't available to cp until accessed.
+		set currentStage to "downloading documents from cloud storage"
+		display notification "Downloading files from cloud storage..." with title "Redline"
+		tell application "Microsoft Word"
+			activate
+			set _dlCount to count documents
+			set _dlNames to {}
+			repeat with _i from 1 to _dlCount
+				set end of _dlNames to (name of document _i)
+			end repeat
+		end tell
+		do shell script "open -a 'Microsoft Word' " & quoted form of origPOSIX
+		tell application "Microsoft Word"
+			set deadline to (current date) + 120
+			repeat until (count documents) > _dlCount or (current date) > deadline
+				delay 0.5
+			end repeat
+			if (count documents) <= _dlCount then error "Timed out downloading " & origName & " from cloud storage"
+			delay 2
+			set _n to count documents
+			repeat with _i from 1 to _n
+				if (name of document _i) is not in _dlNames then
+					close document _i saving no
+					exit repeat
+				end if
+			end repeat
+		end tell
+
+		tell application "Microsoft Word"
+			set _dlCount2 to count documents
+			set _dlNames2 to {}
+			repeat with _i from 1 to _dlCount2
+				set end of _dlNames2 to (name of document _i)
+			end repeat
+		end tell
+		do shell script "open -a 'Microsoft Word' " & quoted form of revPOSIX
+		tell application "Microsoft Word"
+			set deadline to (current date) + 120
+			repeat until (count documents) > _dlCount2 or (current date) > deadline
+				delay 0.5
+			end repeat
+			if (count documents) <= _dlCount2 then error "Timed out downloading " & revName & " from cloud storage"
+			delay 2
+			set _n2 to count documents
+			repeat with _i from 1 to _n2
+				if (name of document _i) is not in _dlNames2 then
+					close document _i saving no
+					exit repeat
+				end if
+			end repeat
+		end tell
+
+		-- Shell-copy both documents to temp paths before opening anything in Word.
+		-- Word Compare should operate on clean saved copies after accepting any
+		-- existing tracked changes, not on the live source files.
+		set currentStage to "copying documents to temp files"
+		do shell script "cp " & quoted form of origPOSIX & " " & quoted form of tempOrigPOSIX
+		do shell script "cp " & quoted form of revPOSIX & " " & quoted form of tempRevPOSIX
+		set currentStage to "normalizing temp documents"
+		set normalizerScriptPOSIX to POSIX path of (path to home folder) & "Library/Services/Redline with Word.workflow/Contents/Resources/normalize_docx.py"
+		do shell script "/usr/bin/python3 " & quoted form of normalizerScriptPOSIX & " " & quoted form of tempOrigPOSIX
+		do shell script "/usr/bin/python3 " & quoted form of normalizerScriptPOSIX & " " & quoted form of tempRevPOSIX
+
+		-- Open temp orig via shell (Launch Services path — no "Grant File Access" dialog).
+		-- Keep Word frontmost while automating it; background Word often stalls.
+		-- Snapshot document names so we can identify the new one by elimination
+		set currentStage to "opening original temp document"
+		set _docsBefore to {}
+		tell application "Microsoft Word"
+			set _n0 to count documents
+			repeat with _i from 1 to _n0
+				set end of _docsBefore to (name of document _i)
+			end repeat
+		end tell
+		do shell script "open -a 'Microsoft Word' " & quoted form of tempOrigPOSIX
+		tell application "Microsoft Word"
+			activate
+			set deadline to (current date) + 30
+			repeat until (count documents) > _n0 or (current date) > deadline
+				delay 0.4
+			end repeat
+			if (count documents) <= _n0 then error "Timed out opening temp copy of " & origName
+			-- Capture the document NAME (not an index) — index-based refs go stale
+			-- when other documents open and Word renumbers them
+			set _n to count documents
+			repeat with _i from 1 to _n
+				set _name to name of document _i
+				if _name is not in _docsBefore then
+					set origDocName to _name
+					exit repeat
+				end if
+			end repeat
+		end tell
+		if origDocName is "" then error "Could not identify temp copy of " & origName & " in Word"
+
+		-- Open temp copy via shell the same way
+		set currentStage to "opening revised temp document"
+		set _docsBefore2 to {}
+		tell application "Microsoft Word"
+			set _n1 to count documents
+			repeat with _i from 1 to _n1
+				set end of _docsBefore2 to (name of document _i)
+			end repeat
+		end tell
+		do shell script "open -a 'Microsoft Word' " & quoted form of tempRevPOSIX
+		tell application "Microsoft Word"
+			activate
+			set deadline to (current date) + 30
+			repeat until (count documents) > _n1 or (current date) > deadline
+				delay 0.4
+			end repeat
+			if (count documents) <= _n1 then error "Timed out opening temp copy of " & revName
+		end tell
+		-- tempRevName is a fixed known string — no need to find it dynamically
+
+		tell application "Microsoft Word"
+			activate
+
+			-- Accept tracked changes in temp copies only — originals on disk never touched.
+			-- Use name-based references: stable regardless of document index shifts
+			set currentStage to "accepting existing revisions"
+			try
+				set track revisions of document origDocName to false
+			end try
+			try
+				set track revisions of document tempRevName to false
+			end try
+			try
+				tell document origDocName to accept all revisions
+			end try
+			try
+				tell document tempRevName to accept all revisions
+			end try
+			-- Document-level save writes accepted-revisions state to temp files in place.
+			set currentStage to "saving cleaned temp documents"
+			tell document origDocName to save
+			tell document tempRevName to save
+			close document tempRevName saving no
+			delay 0.3
+
+			-- Snapshot doc names before compare so we can find the result doc by elimination
+			-- (active document is unreliable when windows are minimized)
+			set docCountBefore to count documents
+			set _namesBeforeCompare to {}
+			repeat with _i from 1 to docCountBefore
+				set end of _namesBeforeCompare to (name of document _i)
+			end repeat
+
+			set compDocName to ""
+
+			-- Compare cleaned original temp copy against cleaned revised temp copy.
+			-- Keep Word's default compare target behavior for save compatibility,
+			-- but suppress formatting-only revisions.
+			set currentStage to "running Word compare"
+			try
+				-- Temp files are on the Desktop so their paths are clean (no @, spaces, etc.)
+				compare document origDocName path tempRevPOSIX detect format changes false ignore all comparison warnings true
+			on error errMsg
+				try
+					close document origDocName saving no
+				end try
+				try
+					close document tempRevName saving no
+				end try
+				do shell script "rm -f " & quoted form of tempOrigPOSIX
+				do shell script "rm -f " & quoted form of tempRevPOSIX
+				display dialog "Compare failed: " & errMsg & return & return & "Files: " & return & origName & return & revName
+				return input
+			end try
+
+			set currentStage to "finding comparison result"
+			delay 5
+			set compDocName to name of active document
+
+			if compDocName is "" then
+				close document origDocName saving no
+				do shell script "rm -f " & quoted form of tempOrigPOSIX
+				do shell script "rm -f " & quoted form of tempRevPOSIX
+				display dialog "No differences found between the two documents." buttons {"OK"} default button 1
+				return input
+			end if
+
+			-- Save comparison result to Desktop first (Word always has write access there),
+			-- then shell-move to the final location. This avoids Word's sandbox write
+			-- restrictions when the destination is on Google Drive / iCloud Drive.
+			set _tmpOut to POSIX path of (path to desktop) & ".__rltmp_out.docx"
+			-- Ensure tracked changes are visible when the saved file is opened
+			set currentStage to "saving comparison result"
+			set show revisions of document compDocName to true
+			try
+				set show revisions and comments of view of active window to true
+				set show insertions and deletions of view of active window to true
+				set revisions view of view of active window to revisions view final
+				set revisions mode of view of active window to in line revisions
+			end try
+			display notification "Saving " & outName & "..." with title "Redline"
+			set compDocForSave to document compDocName
+			save as compDocForSave file name _tmpOut file format format document
+			try
+				close compDocForSave saving no
+			end try
+			-- Close temporary source documents; the final redline will be reopened
+			-- after post-processing and left open for review.
+			try
+				close document origDocName saving no
+			end try
+			try
+				close document tempOrigName saving no
+			end try
+			try
+				close document tempRevName saving no
+			end try
+		end tell
+
+		set currentStage to "cleaning redundant redline changes"
+		set cleanupScriptPOSIX to POSIX path of (path to home folder) & "Library/Services/Redline with Word.workflow/Contents/Resources/clean_redline.py"
+		do shell script "/usr/bin/python3 " & quoted form of cleanupScriptPOSIX & " " & quoted form of _tmpOut
+
+		set currentStage to "moving final output"
+		do shell script "mv -f " & quoted form of _tmpOut & " " & quoted form of finalOutPOSIX
+		set currentStage to "cleaning final redline output"
+		do shell script "/usr/bin/python3 " & quoted form of cleanupScriptPOSIX & " " & quoted form of finalOutPOSIX
+		do shell script "rm -f " & quoted form of tempOrigPOSIX
+		do shell script "rm -f " & quoted form of tempRevPOSIX
+		set currentStage to "opening final redline output"
+		do shell script "open -a 'Microsoft Word' " & quoted form of finalOutPOSIX
+		tell application "Microsoft Word"
+			try
+				close document ".__rltmp_out.docx" saving no
+			end try
+			try
+				close document tempOrigName saving no
+			end try
+			try
+				close document tempRevName saving no
+			end try
+		end tell
+		display notification outName with title "Redline" subtitle "Done"
+
+	on error errMsg number errNum
+		try
+			do shell script "rm -f " & quoted form of tempOrigPOSIX
+		end try
+		try
+			do shell script "rm -f " & quoted form of tempRevPOSIX
+		end try
+		try
+			do shell script "rm -f " & quoted form of (POSIX path of (path to desktop) & ".__rltmp_out.docx")
+		end try
+		try
+			tell application "Microsoft Word"
+				try
+					close document origDocName saving no
+				end try
+				try
+					close document tempOrigName saving no
+				end try
+				try
+					close document tempRevName saving no
+				end try
+				try
+					close document outName saving no
+				end try
+			end tell
+		end try
+		display notification "Error at " & currentStage & ": " & errMsg with title "Redline"
+		display dialog "Redline failed at " & currentStage & ": " & errMsg & " (error " & errNum & ")" buttons {"OK"} default button 1 with icon stop
+	end try
+
+	return input
+end run
+
+-- Return lowercase file extension, or "" if none
+on getExtension(fileName)
+	if fileName does not contain "." then return ""
+	set oldDelims to AppleScript's text item delimiters
+	set AppleScript's text item delimiters to "."
+	set parts to text items of fileName
+	set ext to last item of parts
+	set AppleScript's text item delimiters to oldDelims
+	return do shell script "echo " & quoted form of ext & " | tr '[:upper:]' '[:lower:]'"
+end getExtension
+
+-- Return POSIX path of the parent directory (with trailing slash)
+on parentDirPOSIX(p)
+	set oldDelims to AppleScript's text item delimiters
+	set AppleScript's text item delimiters to "/"
+	set parts to text items of p
+	if (count of parts) <= 2 then
+		set AppleScript's text item delimiters to oldDelims
+		return "/"
+	end if
+	set dirParts to items 1 thru -2 of parts
+	set AppleScript's text item delimiters to "/"
+	set dirPath to (dirParts as text) & "/"
+	set AppleScript's text item delimiters to oldDelims
+	return dirPath
+end parentDirPOSIX
+
+-- Strip the last extension from a filename
+on stripExtension(fileName)
+	set oldDelims to AppleScript's text item delimiters
+	if fileName is "" then
+		set AppleScript's text item delimiters to oldDelims
+		return ""
+	end if
+	if fileName does not contain "." then
+		set AppleScript's text item delimiters to oldDelims
+		return fileName
+	end if
+	set AppleScript's text item delimiters to "."
+	set nameItems to text items of fileName
+	set itemCount to count of nameItems
+	if itemCount is 2 and item 1 of nameItems is "" then
+		set AppleScript's text item delimiters to oldDelims
+		return fileName
+	end if
+	if itemCount > 1 then
+		set resultItems to items 1 thru (itemCount - 1) of nameItems
+		set AppleScript's text item delimiters to "."
+		set resultText to resultItems as text
+		set AppleScript's text item delimiters to oldDelims
+		return resultText
+	else
+		set AppleScript's text item delimiters to oldDelims
+		return fileName
+	end if
+end stripExtension
