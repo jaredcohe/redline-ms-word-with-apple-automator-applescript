@@ -30,7 +30,7 @@ on run {input, parameters}
 	-- Output name
 	set revNameNoExt to my stripExtension(revName)
 	if revNameNoExt is "" or revNameNoExt starts with "." then set revNameNoExt to "comparison"
-	set outNameBase to do shell script "/usr/bin/python3 -c 'import re,sys;name=sys.argv[1];m=re.search(r\"(\\d+\\.\\d+)\",name);print(name.replace(m.group(1),\"{:.1f}\".format(round(float(m.group(1))+0.1,1)),1) if m else name)' " & quoted form of revNameNoExt
+	set outNameBase to do shell script "/usr/bin/python3 -c 'import re,sys;name=sys.argv[1];m=re.search(r\"(\\d+\\.\\d+)\",name);m2=None if m else re.search(r\"([vV])(\\d+)\\b\",name);print(name.replace(m.group(1),\"{:.1f}\".format(round(float(m.group(1))+0.1,1)),1) if m else (name.replace(m2.group(0),m2.group(1)+m2.group(2)+\".1\",1) if m2 else name))' " & quoted form of revNameNoExt
 	set outName to outNameBase & ".docx"
 	set finalOutPOSIX to directoryPath & outName
 
