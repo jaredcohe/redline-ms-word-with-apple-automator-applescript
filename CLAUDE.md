@@ -1,16 +1,24 @@
 # Notes for future Claude sessions
 
-## Deployment — always sync after editing clean_redline.py
+## Deployment
 
-After any edit to `clean_redline.py` or `normalize_docx.py`, run:
+The Automator workflow bundle has its own copies of scripts — edits to the project directory have no effect until deployed.
+
+### Edited `applescript-v2`? → use `install.sh`
+
+```bash
+./install.sh
+```
+
+Runs all tests, then rebuilds the entire bundle from scratch. **Required for any AppleScript change.** Do NOT use `sync.sh` for this — it will silently leave the old AppleScript in place.
+
+### Edited `clean_redline.py` or `normalize_docx.py` only? → use `sync.sh`
 
 ```bash
 ./sync.sh
 ```
 
-This copies both scripts into the workflow bundle. The Automator workflow bundles its own copy and never reads from the project directory, so edits have no effect until synced.
-
-For a full rebuild (AppleScript changes, first install): use `install.sh` instead — it runs all tests first, then rebuilds the entire bundle.
+Copies only the two Python scripts into the bundle. Faster, but does not touch the AppleScript.
 
 ### Checking what was cleaned
 
