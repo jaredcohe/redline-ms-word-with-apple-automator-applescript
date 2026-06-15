@@ -12,13 +12,13 @@ on run {input, parameters}
 	set revName to name of (info for revAlias)
 
 	-- Validate file extensions
-	set validExts to {"docx", "doc", "docm"}
+	set validExts to {"docx", "doc", "docm", "gdoc"}
 	if my getExtension(origName) is not in validExts then
-		display dialog origName & " is not a Word document (.docx/.doc/.docm)" buttons {"OK"} default button 1 with icon stop
+		display dialog origName & " is not a Word or Google document (.docx/.doc/.docm/.gdoc)" buttons {"OK"} default button 1 with icon stop
 		return input
 	end if
 	if my getExtension(revName) is not in validExts then
-		display dialog revName & " is not a Word document (.docx/.doc/.docm)" buttons {"OK"} default button 1 with icon stop
+		display dialog revName & " is not a Word or Google document (.docx/.doc/.docm/.gdoc)" buttons {"OK"} default button 1 with icon stop
 		return input
 	end if
 
@@ -68,56 +68,77 @@ on run {input, parameters}
 
 		-- Open each original in Word to force Google Drive to download it to local disk,
 		-- then close it. Files stored cloud-only aren't available to cp until accessed.
+		-- Skip for .gdoc files — they are already local JSON shortcuts; content is exported separately below.
 		set currentStage to "downloading documents from cloud storage"
 		display notification "Downloading files from cloud storage..." with title "Redline"
-		tell application "Microsoft Word"
-			activate
-			set _dlCount to count documents
-			set _dlNames to {}
-			repeat with _i from 1 to _dlCount
-				set end of _dlNames to (name of document _i)
-			end repeat
-		end tell
-		do shell script "open -a 'Microsoft Word' " & quoted form of origPOSIX
-		tell application "Microsoft Word"
-			set deadline to (current date) + 120
-			repeat until (count documents) > _dlCount or (current date) > deadline
-				delay 0.5
-			end repeat
-			if (count documents) <= _dlCount then error "Timed out downloading " & origName & " from cloud storage"
-			delay 2
-			set _n to count documents
-			repeat with _i from 1 to _n
-				if (name of document _i) is not in _dlNames then
-					close document _i saving no
-					exit repeat
-				end if
-			end repeat
-		end tell
+		if my getExtension(origName) is not "gdoc" then
+			tell application "Microsoft Word"
+				activate
+				set _dlCount to count documents
+				set _dlNames to {}
+				repeat with _i from 1 to _dlCount
+					set end of _dlNames to (name of document _i)
+				end repeat
+			end tell
+			do shell script "open -a 'Microsoft Word' " & quoted form of origPOSIX
+			tell application "Microsoft Word"
+				set deadline to (current date) + 120
+				repeat until (count documents) > _dlCount or (current date) > deadline
+					delay 0.5
+				end repeat
+				if (count documents) <= _dlCount then error "Timed out downloading " & origName & " from cloud storage"
+				delay 2
+				set _n to count documents
+				repeat with _i from 1 to _n
+					if (name of document _i) is not in _dlNames then
+						close document _i saving no
+						exit repeat
+					end if
+				end repeat
+			end tell
+		end if
 
-		tell application "Microsoft Word"
-			set _dlCount2 to count documents
-			set _dlNames2 to {}
-			repeat with _i from 1 to _dlCount2
-				set end of _dlNames2 to (name of document _i)
-			end repeat
-		end tell
-		do shell script "open -a 'Microsoft Word' " & quoted form of revPOSIX
-		tell application "Microsoft Word"
-			set deadline to (current date) + 120
-			repeat until (count documents) > _dlCount2 or (current date) > deadline
-				delay 0.5
-			end repeat
-			if (count documents) <= _dlCount2 then error "Timed out downloading " & revName & " from cloud storage"
-			delay 2
-			set _n2 to count documents
-			repeat with _i from 1 to _n2
-				if (name of document _i) is not in _dlNames2 then
-					close document _i saving no
-					exit repeat
-				end if
-			end repeat
-		end tell
+		if my getExtension(revName) is not "gdoc" then
+			tell application "Microsoft Word"
+				set _dlCount2 to count documents
+				set _dlNames2 to {}
+				repeat with _i from 1 to _dlCount2
+					set end of _dlNames2 to (name of document _i)
+				end repeat
+			end tell
+			do shell script "open -a 'Microsoft Word' " & quoted form of revPOSIX
+			tell application "Microsoft Word"
+				set deadline to (current date) + 120
+				repeat until (count documents) > _dlCount2 or (current date) > deadline
+					delay 0.5
+				end repeat
+				if (count documents) <= _dlCount2 then error "Timed out downloading " & revName & " from cloud storage"
+				delay 2
+				set _n2 to count documents
+				repeat with _i from 1 to _n2
+					if (name of document _i) is not in _dlNames2 then
+						close document _i saving no
+						exit repeat
+					end if
+				end repeat
+			end tell
+		end if
+
+		-- Export any .gdoc files to .docx in their source directory before copying.
+		if my getExtension(origName) is "gdoc" then
+			set currentStage to "exporting original Google Doc"
+			display notification "Exporting Google Doc: " & origName with title "Redline"
+			set origExportPOSIX to my parentDirPOSIX(origPOSIX) & my stripExtension(origName) & ".docx"
+			my gdocExportToDocx(origPOSIX, origExportPOSIX)
+			set origPOSIX to origExportPOSIX
+		end if
+		if my getExtension(revName) is "gdoc" then
+			set currentStage to "exporting revised Google Doc"
+			display notification "Exporting Google Doc: " & revName with title "Redline"
+			set revExportPOSIX to directoryPath & my stripExtension(revName) & ".docx"
+			my gdocExportToDocx(revPOSIX, revExportPOSIX)
+			set revPOSIX to revExportPOSIX
+		end if
 
 		-- Shell-copy both documents to temp paths before opening anything in Word.
 		-- Word Compare should operate on clean saved copies after accepting any
@@ -365,6 +386,27 @@ on parentDirPOSIX(p)
 	set AppleScript's text item delimiters to oldDelims
 	return dirPath
 end parentDirPOSIX
+
+-- Export a Google Doc (.gdoc) to .docx by opening the export URL in the default
+-- browser (already authenticated) and waiting for the download to land in ~/Downloads,
+-- then moving it to destPOSIX.
+on gdocExportToDocx(gdocPOSIX, destPOSIX)
+	set docId to do shell script "/opt/homebrew/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"doc_id\"])' " & quoted form of gdocPOSIX
+	if docId is "" then error "Could not read document ID from " & gdocPOSIX
+	set markerPath to "/tmp/.redline_gdoc_marker"
+	do shell script "touch " & quoted form of markerPath
+	open location "https://docs.google.com/document/d/" & docId & "/export?format=docx"
+	set deadline to (current date) + 60
+	set downloadedPath to ""
+	repeat
+		delay 2
+		set downloadedPath to do shell script "find ~/Downloads -maxdepth 1 -name '*.docx' -newer " & quoted form of markerPath & " 2>/dev/null | head -1"
+		if downloadedPath is not "" then exit repeat
+		if (current date) > deadline then error "Timed out waiting for Google Doc export — ensure your browser is signed in to Google"
+	end repeat
+	do shell script "rm -f " & quoted form of markerPath
+	do shell script "mv -f " & quoted form of downloadedPath & " " & quoted form of destPOSIX
+end gdocExportToDocx
 
 -- Strip the last extension from a filename
 on stripExtension(fileName)
