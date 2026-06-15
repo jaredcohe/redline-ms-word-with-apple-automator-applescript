@@ -391,7 +391,7 @@ end parentDirPOSIX
 -- browser (already authenticated) and waiting for the download to land in ~/Downloads,
 -- then moving it to destPOSIX.
 on gdocExportToDocx(gdocPOSIX, destPOSIX)
-	set docId to do shell script "/opt/homebrew/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"doc_id\"])' " & quoted form of gdocPOSIX
+	set docId to do shell script "/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"doc_id\"])' " & quoted form of gdocPOSIX
 	if docId is "" then error "Could not read document ID from " & gdocPOSIX
 	set markerPath to "/tmp/.redline_gdoc_marker"
 	do shell script "touch " & quoted form of markerPath
