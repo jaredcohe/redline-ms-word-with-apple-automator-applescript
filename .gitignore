@@ -1,3 +1,6 @@
 .claude/
 __pycache__/
 *.pyc
+.DS_Store
+# Real client documents used for local diagnosis — never commit (confidential).
+examples/

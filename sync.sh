@@ -12,4 +12,5 @@ fi
 
 cp "$SCRIPT_DIR/clean_redline.py" "$BUNDLE/"
 cp "$SCRIPT_DIR/normalize_docx.py" "$BUNDLE/"
+cp "$SCRIPT_DIR/next_version_name.py" "$BUNDLE/"
 echo "Scripts synced to workflow bundle."

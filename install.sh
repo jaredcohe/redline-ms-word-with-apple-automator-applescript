@@ -16,7 +16,7 @@ fi
 echo "Installing '${WORKFLOW_NAME}'..."
 
 echo "Running tests..."
-(cd "$SCRIPT_DIR" && python3 -m unittest tests/test_clean_redline.py -q) || { echo "Tests failed — aborting install."; exit 1; }
+(cd "$SCRIPT_DIR" && python3 -m unittest discover -s tests -q) || { echo "Tests failed — aborting install."; exit 1; }
 echo ""
 
 # Remove any previous version

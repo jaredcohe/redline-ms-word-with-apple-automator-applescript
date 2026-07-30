@@ -96,6 +96,22 @@ PROTECTED_TAGS = {
     f"{{{NAMESPACES['o']}}}OLEObject",
 }
 
+# Elements that represent an embedded picture (the logo). A tracked change whose only
+# content is one of these is resolved so the image never renders as a tracked change.
+IMAGE_TAGS = {
+    W + "drawing",
+    W + "pict",
+    f"{{{NAMESPACES['v']}}}shape",
+    f"{{{NAMESPACES['v']}}}imagedata",
+}
+
+# Embedded OLE objects (spreadsheets, equations, …) are NOT logos — a revision containing
+# one is left alone even though it may render as a picture.
+OLE_TAGS = {
+    W + "object",
+    f"{{{NAMESPACES['o']}}}OLEObject",
+}
+
 
 def iter_text(element: ET.Element, tag: str) -> Iterable[str]:
     for child in element.iter(tag):
@@ -192,6 +208,22 @@ def accepted_children(element: ET.Element) -> list[ET.Element]:
     if element.tag == INS:
         return [copy.deepcopy(child) for child in list(element)]
     return []
+
+
+def del_to_unchanged_runs(del_elem: ET.Element) -> list[ET.Element]:
+    """Convert a <w:del> into plain unchanged runs (delText -> t), preserving rPr.
+
+    Used to turn a spurious deletion of unchanged text back into normal body text.
+    """
+    runs = []
+    for child in list(del_elem):
+        if child.tag != W + "r":
+            continue
+        run = copy.deepcopy(child)
+        for dt in run.findall(DEL_TEXT):
+            dt.tag = TEXT
+        runs.append(run)
+    return runs
 
 
 def is_checkbox_sdt(element: ET.Element) -> bool:
@@ -751,6 +783,245 @@ def clean_heading_full_ins_noop(root: ET.Element) -> int:
     return changed
 
 
+def paragraph_mark_has_revision(p: ET.Element) -> bool:
+    """True if the paragraph mark itself is a tracked change (w:pPr/w:rPr/w:ins|w:del)."""
+    pPr = p.find(W + "pPr")
+    if pPr is None:
+        return False
+    rPr = pPr.find(W + "rPr")
+    if rPr is None:
+        return False
+    return rPr.find(INS) is not None or rPr.find(DEL) is not None
+
+
+def clean_empty_list_paragraphs(root: ET.Element) -> int:
+    """Remove orphan empty list paragraphs that render a bare list marker.
+
+    When paragraph counts differ between the two compared documents, Word Compare emits
+    empty list paragraphs as alignment padding. They carry a <w:numPr> (so they render a
+    bullet/number/letter marker, e.g. numId=60 -> "(a) (b) (c) ...") but hold no visible
+    text and no deleted text, and their paragraph mark is not itself a tracked change, so
+    they survive both Accept and Reject. The only way to remove them is to delete the
+    <w:p> outright.
+
+    A paragraph is removed only when ALL hold:
+    - it has list numbering (pPr/numPr present),
+    - it has no visible text and no deleted text (whitespace-only counts as empty),
+    - it has no protected content (bookmarks, drawings, tables, fields, comment anchors,
+      hyperlinks) — this preserves list paragraphs that anchor cross-reference bookmarks,
+    - its paragraph mark is not itself a tracked change.
+
+    Paragraphs whose content is a tracked deletion (e.g. "Intentionally omitted.") are
+    kept, so real deletions stay visible in the redline.
+    """
+    changed = 0
+
+    def is_empty_list_paragraph(p: ET.Element) -> bool:
+        pPr = p.find(W + "pPr")
+        if pPr is None or pPr.find(W + "numPr") is None:
+            return False
+        if norm("".join(iter_text(p, TEXT))) != "" or norm("".join(iter_text(p, DEL_TEXT))) != "":
+            return False
+        if has_protected_content(p):
+            return False
+        if paragraph_mark_has_revision(p):
+            return False
+        return True
+
+    def walk(parent: ET.Element) -> None:
+        nonlocal changed
+        # A table cell must retain at least one paragraph; never remove its last one.
+        is_cell = parent.tag == W + "tc"
+        for child in list(parent):
+            if child.tag == W + "p":
+                if is_empty_list_paragraph(child):
+                    if is_cell and sum(1 for c in parent if c.tag == W + "p") <= 1:
+                        continue
+                    parent.remove(child)
+                    changed += 1
+            else:
+                walk(child)
+
+    walk(root)
+    return changed
+
+
+def _last_ins_last_run(p: ET.Element) -> tuple[ET.Element, ET.Element, str] | None:
+    """Return (ins_elem, last_run, text) for the last <w:r> of p's last top-level <w:ins>."""
+    last_ins = None
+    for child in p:
+        if child.tag == INS:
+            last_ins = child
+    if last_ins is None or has_protected_content(last_ins):
+        return None
+    last_run = None
+    last_text = ""
+    for r in last_ins:
+        if r.tag != W + "r":
+            continue
+        text = "".join(t.text or "" for t in r.iter(TEXT))
+        if text:
+            last_run = r
+            last_text = text
+    if last_run is None:
+        return None
+    return last_ins, last_run, last_text
+
+
+def clean_trailing_heading_ins_del_noop(root: ET.Element) -> int:
+    """Clean a no-op where an unchanged heading is shown as both inserted and deleted.
+
+    Word Compare sometimes appends an unchanged heading's text as the LAST inserted run of
+    a preceding (real body-edit) paragraph, while marking the heading's true location as a
+    full deletion a few paragraphs later. Detected pattern (forward window of 3):
+
+    - Para N: its last top-level <w:ins> ends with a run whose text is T
+    - Para B (optional): deletion-only paragraphs — skip and keep scanning
+    - Para C (heading): a heading paragraph whose ENTIRE deleted text equals T
+
+    Fix: drop the trailing <w:ins> run T from para N (keeping the real insertion), and turn
+    para C's deletion of T into plain unchanged text (preserving its pPr/numPr/bookmark).
+    """
+    changed = 0
+
+    def walk(parent: ET.Element) -> None:
+        nonlocal changed
+        paras = [child for child in parent if child.tag == W + "p"]
+
+        for idx, p in enumerate(paras):
+            found = _last_ins_last_run(p)
+            if found is None:
+                continue
+            ins_elem, ins_run, ins_text = found
+            if not norm(ins_text):
+                continue
+
+            for fwd in range(1, 4):
+                if idx + fwd >= len(paras):
+                    break
+                target = paras[idx + fwd]
+
+                dels = [c for c in target if c.tag == DEL]
+                if dels:
+                    if is_heading_paragraph(target):
+                        del_text = "".join(iter_text(target, DEL_TEXT))
+                        if norm(del_text) == norm(ins_text):
+                            # Drop the trailing ins run T from para N.
+                            ins_elem.remove(ins_run)
+                            if not any(
+                                r.tag == W + "r" and r.find(TEXT) is not None
+                                for r in ins_elem
+                            ):
+                                p.remove(ins_elem)
+                            # Turn each del in target into unchanged text.
+                            for del_elem in dels:
+                                del_index = list(target).index(del_elem)
+                                target[del_index: del_index + 1] = del_to_unchanged_runs(del_elem)
+                            changed += 1
+                            break
+                    # Heading (or any) del that doesn't match: stop unless deletion-only.
+                if not is_deletion_only_paragraph(target):
+                    break
+
+        for child in parent:
+            if child.tag != W + "p":
+                walk(child)
+
+    walk(root)
+    return changed
+
+
+def _page_size(sect: ET.Element) -> tuple[str | None, str | None, str | None] | None:
+    """Return (w, h, orient) of a <w:sectPr>'s <w:pgSz>, or None if absent."""
+    pgSz = sect.find(W + "pgSz")
+    if pgSz is None:
+        return None
+    return (pgSz.get(W + "w"), pgSz.get(W + "h"), pgSz.get(W + "orient"))
+
+
+def clean_cosmetic_section_breaks(root: ET.Element) -> int:
+    """Remove mid-document section breaks that Word Compare silently injects.
+
+    With `detect format changes false`, Word Compare adopts the revised document's section
+    structure without tracking it, so section breaks that exist only in the revised file
+    appear in the output as untracked, non-rejectable page breaks. We strip a mid-document
+    <w:sectPr> only when its page size/orientation matches the document's final (body-level)
+    section — i.e. it is a purely cosmetic page break, not a landscape/differently-sized
+    section. The body-level <w:sectPr> (whole-document page setup) is never removed, and no
+    paragraph is deleted, so bookmarks and alignment are preserved.
+    """
+    body = root.find(W + "body")
+    if body is None:
+        return 0
+    body_sect = body.find(W + "sectPr")
+    if body_sect is None:
+        return 0
+    body_pgsz = _page_size(body_sect)
+    if body_pgsz is None:
+        return 0
+
+    changed = 0
+    for p in body.iter(W + "p"):
+        pPr = p.find(W + "pPr")
+        if pPr is None:
+            continue
+        sect = pPr.find(W + "sectPr")
+        if sect is None:
+            continue
+        if _page_size(sect) == body_pgsz:
+            pPr.remove(sect)
+            changed += 1
+    return changed
+
+
+def _is_image_only_revision(elem: ET.Element) -> bool:
+    """True if `elem` is a <w:ins>/<w:del> that wraps an image and no visible text.
+
+    Word Compare marks the logo as an insert+delete pair of the picture when the two
+    documents reference it via different relationships. We resolve those so the logo is
+    never shown as changed, but only when the revision has no text — a revision mixing real
+    text edits with an image is left alone.
+    """
+    if elem.tag not in {INS, DEL}:
+        return False
+    tags = {node.tag for node in elem.iter()}
+    if not (tags & IMAGE_TAGS):
+        return False
+    if tags & OLE_TAGS:  # preserve embedded OLE objects — they are not logos
+        return False
+    return revision_text(elem).strip() == ""
+
+
+def clean_image_revisions(root: ET.Element) -> int:
+    """Never show an image (the logo) as a tracked change.
+
+    Accept image-only insertions (unwrap to a normal, unchanged run) and drop image-only
+    deletions. On a delete+insert pair this keeps a single unmarked image; this is what
+    Word's "Accept All" would produce, but the image no longer renders as a change.
+    """
+    changed = 0
+
+    def walk(parent: ET.Element) -> None:
+        nonlocal changed
+        i = 0
+        while i < len(parent):
+            child = parent[i]
+            if _is_image_only_revision(child):
+                if child.tag == INS:
+                    replacement = accepted_children(child)
+                    parent[i: i + 1] = replacement
+                    i += len(replacement)
+                else:  # DEL
+                    parent.remove(child)
+                changed += 1
+                continue
+            walk(child)
+            i += 1
+
+    walk(root)
+    return changed
+
+
 def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
     root = ET.fromstring(xml_bytes)
     changed_ignorable = clean_ignorable_namespaces(root)
@@ -763,6 +1034,10 @@ def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
             + clean_paragraph_boundary_noop(root)
             + clean_heading_full_ins_noop(root)
             + clean_misplaced_deletions_after_heading(root)
+            + clean_trailing_heading_ins_del_noop(root)
+            + clean_empty_list_paragraphs(root)
+            + clean_image_revisions(root)
+            + clean_cosmetic_section_breaks(root)
         )
         if changed == 0:
             break
@@ -799,11 +1074,22 @@ def clean_ignorable_namespaces(root: ET.Element) -> int:
     return 1
 
 
+# Parts that carry body-style content and can hold a logo revision: the main document plus
+# every header/footer (logos live in page headers for some templates).
+CLEANABLE_PART_RE = re.compile(r"^word/(document|header\d+|footer\d+)\.xml$")
+
+
 def rewrite_docx(path: Path) -> int:
     with ZipFile(path, "r") as zin:
         infos = zin.infolist()
-        document_xml = zin.read("word/document.xml")
-        cleaned_xml, changed = clean_document_xml(document_xml)
+        cleaned_parts: dict[str, bytes] = {}
+        changed = 0
+        for info in infos:
+            if CLEANABLE_PART_RE.match(info.filename):
+                cleaned_xml, part_changed = clean_document_xml(zin.read(info.filename))
+                if part_changed:
+                    cleaned_parts[info.filename] = cleaned_xml
+                    changed += part_changed
 
         if changed == 0:
             return 0
@@ -814,7 +1100,7 @@ def rewrite_docx(path: Path) -> int:
         try:
             with ZipFile(tmp_path, "w", ZIP_DEFLATED) as zout:
                 for info in infos:
-                    data = cleaned_xml if info.filename == "word/document.xml" else zin.read(info.filename)
+                    data = cleaned_parts.get(info.filename) or zin.read(info.filename)
                     zout.writestr(info, data)
             shutil.move(str(tmp_path), str(path))
         finally:

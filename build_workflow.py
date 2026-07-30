@@ -242,7 +242,7 @@ def main():
         f.write(wflow)
 
     resources_dir = os.path.join(dest_dir, "Resources")
-    for helper_name in ("clean_redline.py", "normalize_docx.py"):
+    for helper_name in ("clean_redline.py", "normalize_docx.py", "next_version_name.py"):
         helper_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), helper_name)
         if os.path.isfile(helper_src):
             os.makedirs(resources_dir, exist_ok=True)

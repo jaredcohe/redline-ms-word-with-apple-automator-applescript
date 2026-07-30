@@ -63,12 +63,14 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertEqual(root.findall(f".//{W}ins"), [])
         self.assertEqual("".join(root.itertext()).strip(), "1.4 Independent Contractor Status.")
 
-    def test_preserves_empty_revision_with_drawing_relationship(self):
+    def test_accepts_linked_drawing_insertion(self):
+        # A linked image (logo) insertion is accepted to an unchanged run — never shown
+        # as a tracked change (per the "images never show as changed" rule).
         root = clean_fragment(
             "<w:p><w:ins w:id=\"1\"><w:r><w:drawing r:id=\"rId5\"/></w:r></w:ins></w:p>"
         )
 
-        self.assertEqual(len(root.findall(f".//{W}ins")), 1)
+        self.assertEqual(root.findall(f".//{W}ins"), [])
         self.assertEqual(root.find(f".//{W}drawing").attrib[f"{R}id"], "rId5")
 
     def test_removes_empty_revision_with_unlinked_drawing(self):
@@ -444,6 +446,240 @@ class CleanRedlineTests(unittest.TestCase):
             "".join(p.find(f".//{W}ins").itertext()),
             "Section Title",
         )
+
+    def test_removes_empty_list_paragraph(self):
+        """A numbered paragraph with no runs is a Word Compare orphan marker; remove it."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"60\"/></w:numPr></w:pPr></w:p>"
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+        )
+        paras = root.findall(f".//{W}p")
+        self.assertEqual(len(paras), 1)
+        self.assertEqual("".join(paras[0].itertext()), "Body.")
+
+    def test_removes_whitespace_only_list_paragraph(self):
+        """A numbered paragraph whose only run is whitespace is still an empty orphan."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"60\"/></w:numPr></w:pPr>"
+            "<w:r><w:t xml:space=\"preserve\"> </w:t></w:r></w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}p"), [])
+
+    def test_preserves_list_paragraph_with_bookmark(self):
+        """A numbered paragraph anchoring a cross-reference bookmark must be kept."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"3\"/><w:numId w:val=\"45\"/></w:numPr></w:pPr>"
+            "<w:bookmarkStart w:id=\"652\" w:name=\"_Ref118098509\"/></w:p>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}p")), 1)
+        self.assertIsNotNone(root.find(f".//{W}bookmarkStart"))
+
+    def test_preserves_list_paragraph_with_deletion(self):
+        """A numbered paragraph whose content is a tracked deletion stays visible."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"1\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>"
+            "<w:del w:id=\"85\"><w:r><w:delText>Intentionally omitted. </w:delText></w:r></w:del></w:p>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}p")), 1)
+        self.assertIsNotNone(root.find(f".//{W}del"))
+
+    def test_preserves_list_paragraph_with_text(self):
+        """A normal numbered paragraph with visible text is untouched."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>"
+            "<w:r><w:t>Ownership; Assignment.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}p")), 1)
+        self.assertEqual("".join(root.itertext()).strip(), "Ownership; Assignment.")
+
+    def test_preserves_empty_non_numbered_paragraph(self):
+        """An empty paragraph without numbering is an ordinary blank line; keep it."""
+        root = clean_fragment("<w:p><w:pPr><w:jc w:val=\"both\"/></w:pPr></w:p>")
+        self.assertEqual(len(root.findall(f".//{W}p")), 1)
+
+    def test_preserves_only_paragraph_in_table_cell(self):
+        """Never remove a table cell's last paragraph, even if it is an empty list item."""
+        root = clean_fragment(
+            "<w:tbl><w:tr><w:tc>"
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"60\"/></w:numPr></w:pPr></w:p>"
+            "</w:tc></w:tr></w:tbl>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}p")), 1)
+
+    def test_trailing_heading_ins_del_noop_collapses_unchanged_heading(self):
+        """Heading text inserted at the tail of a body para and deleted at its heading
+        (a few paras later) is an unchanged heading; collapse it to plain text."""
+        root = clean_fragment(
+            "<w:p>"
+            "<w:ins w:id=\"13\">"
+            "<w:r><w:t xml:space=\"preserve\">The fees apply. </w:t></w:r>"
+            "<w:r><w:t>Reimbursable Expenses</w:t></w:r>"
+            "</w:ins>"
+            "</w:p>"
+            "<w:p><w:del w:id=\"1\"><w:r><w:delText>Old body language.</w:delText></w:r></w:del></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>"
+            "<w:bookmarkStart w:id=\"17\" w:name=\"_heading\"/><w:bookmarkEnd w:id=\"17\"/>"
+            "<w:del w:id=\"18\"><w:r><w:delText>Reimbursable Expenses</w:delText></w:r></w:del></w:p>"
+        )
+        paras = root.findall(f".//{W}p")
+        # Body insertion kept, but trailing heading run removed
+        body_ins_text = "".join(paras[0].find(f".//{W}ins").itertext())
+        self.assertIn("The fees apply.", body_ins_text)
+        self.assertNotIn("Reimbursable Expenses", body_ins_text)
+        # Heading paragraph: no ins/del on the text, shows unchanged text, bookmark kept
+        heading = paras[2]
+        self.assertEqual(heading.findall(f".//{W}del"), [])
+        self.assertEqual(heading.findall(f".//{W}ins"), [])
+        self.assertEqual("".join(heading.itertext()), "Reimbursable Expenses")
+        self.assertIsNotNone(heading.find(f".//{W}bookmarkStart"))
+
+    def test_trailing_heading_noop_not_applied_without_matching_del(self):
+        """No collapse when no nearby heading del matches the trailing insertion."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:t>Body. </w:t></w:r><w:r><w:t>Reimbursable Expenses</w:t></w:r></w:ins></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Different Heading</w:delText></w:r></w:del></w:p>"
+        )
+        p = root.findall(f".//{W}p")[0]
+        self.assertIn("Reimbursable Expenses", "".join(p.find(f".//{W}ins").itertext()))
+
+    def test_trailing_heading_noop_requires_full_del_match(self):
+        """A partial (suffix) del match is not a heading no-op; leave it untouched."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:t>Body. </w:t></w:r><w:r><w:t>Reimbursable Expenses</w:t></w:r></w:ins></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Extra Reimbursable Expenses</w:delText></w:r></w:del></w:p>"
+        )
+        p = root.findall(f".//{W}p")[0]
+        self.assertIn("Reimbursable Expenses", "".join(p.find(f".//{W}ins").itertext()))
+        heading = root.findall(f".//{W}p")[1]
+        self.assertIsNotNone(heading.find(f".//{W}del"))
+
+    def test_trailing_heading_noop_requires_heading_target(self):
+        """A matching del in a non-heading paragraph is not collapsed."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:t>Body. </w:t></w:r><w:r><w:t>Reimbursable Expenses</w:t></w:r></w:ins></w:p>"
+            "<w:p><w:del w:id=\"2\"><w:r><w:delText>Reimbursable Expenses</w:delText></w:r></w:del></w:p>"
+        )
+        p = root.findall(f".//{W}p")[0]
+        self.assertIn("Reimbursable Expenses", "".join(p.find(f".//{W}ins").itertext()))
+
+    def test_trailing_heading_noop_stops_at_real_content(self):
+        """A normal paragraph between the insertion and the heading stops the scan."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:t>Body. </w:t></w:r><w:r><w:t>Reimbursable Expenses</w:t></w:r></w:ins></w:p>"
+            "<w:p><w:r><w:t>Unchanged intervening sentence.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Reimbursable Expenses</w:delText></w:r></w:del></w:p>"
+        )
+        p = root.findall(f".//{W}p")[0]
+        self.assertIn("Reimbursable Expenses", "".join(p.find(f".//{W}ins").itertext()))
+
+    def test_removes_cosmetic_mid_document_section_break(self):
+        """A mid-doc section break with the same page size as the body is a Word Compare
+        injection; strip its sectPr but keep the paragraph and the body section."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr>"
+            "<w:r><w:t>End of section one.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        para_sects = [p for p in body.findall(f"{W}p") if p.find(f"{W}pPr/{W}sectPr") is not None]
+        self.assertEqual(para_sects, [])
+        # Paragraph text preserved; body-level sectPr preserved
+        self.assertEqual("".join(body.findall(f"{W}p")[0].itertext()), "End of section one.")
+        self.assertIsNotNone(body.find(f"{W}sectPr"))
+
+    def test_cosmetic_section_break_removal_preserves_bookmark(self):
+        """An empty break-only paragraph keeps its bookmark; only the sectPr is removed."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr>"
+            "<w:bookmarkStart w:id=\"5\" w:name=\"_Ref1\"/><w:bookmarkEnd w:id=\"5\"/></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        self.assertIsNone(body.find(f"{W}p/{W}pPr/{W}sectPr"))
+        self.assertIsNotNone(body.find(f".//{W}bookmarkStart"))
+        self.assertEqual(len(body.findall(f"{W}p")), 1)
+
+    def test_preserves_landscape_section_break(self):
+        """A section break that changes page orientation/size is genuine; keep it."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"15840\" w:h=\"12240\" w:orient=\"landscape\"/></w:sectPr></w:pPr>"
+            "<w:r><w:t>Landscape exhibit.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}p/{W}pPr/{W}sectPr"))
+
+    def test_never_removes_body_level_section(self):
+        """The document's final body-level sectPr is always preserved."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>Only paragraph.</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        self.assertIsNotNone(root.find(f"{W}body/{W}sectPr"))
+
+    def test_accepts_image_only_insertion(self):
+        """A logo inserted by Word Compare is accepted to a normal, unchanged run."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:rPr><w:noProof/></w:rPr>"
+            "<w:drawing r:id=\"rId7\"/></w:r></w:ins></w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertIsNotNone(root.find(f".//{W}drawing"))
+
+    def test_drops_image_only_deletion(self):
+        """A logo deleted by Word Compare is dropped entirely."""
+        root = clean_fragment(
+            "<w:p><w:del w:id=\"1\"><w:r>"
+            "<w:drawing r:id=\"rId8\"/></w:r></w:del></w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertEqual(root.findall(f".//{W}drawing"), [])
+
+    def test_image_insert_delete_pair_collapses_to_one_unmarked_image(self):
+        """The real Phoenix Tower shape: ins-image in one paragraph, del-image in another."""
+        root = clean_fragment(
+            "<w:p><w:bookmarkStart w:id=\"1\" w:name=\"_x\"/><w:bookmarkEnd w:id=\"1\"/>"
+            "<w:ins w:id=\"2\"><w:r><w:drawing r:id=\"rId7\"/></w:r></w:ins></w:p>"
+            "<w:p><w:r><w:t>Some heading text.</w:t></w:r></w:p>"
+            "<w:p><w:del w:id=\"3\"><w:r><w:drawing r:id=\"rId8\"/></w:r></w:del></w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertEqual(len(root.findall(f".//{W}drawing")), 1)
+
+    def test_accepts_vml_pict_image_insertion(self):
+        """A VML <w:pict> logo insertion is also unwrapped."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:pict/></w:r></w:ins></w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertIsNotNone(root.find(f".//{W}pict"))
+
+    def test_preserves_revision_with_image_and_text(self):
+        """A revision that mixes real inserted text with an image is left alone."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\">"
+            "<w:r><w:t>New figure: </w:t></w:r><w:r><w:drawing/></w:r>"
+            "</w:ins></w:p>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}ins"))
+        self.assertIsNotNone(root.find(f".//{W}drawing"))
+
+    def test_image_revision_cleaned_in_header_root(self):
+        """clean_image_revisions works off a <w:hdr> root (headers are cleaned too)."""
+        hdr = ET.fromstring(
+            f"<w:hdr xmlns:w=\"{clean_redline.NAMESPACES['w']}\">"
+            "<w:p><w:del w:id=\"1\"><w:r><w:drawing/></w:r></w:del></w:p>"
+            "</w:hdr>"
+        )
+        changed = clean_redline.clean_image_revisions(hdr)
+        self.assertEqual(changed, 1)
+        self.assertEqual(hdr.findall(f".//{W}del"), [])
+        self.assertEqual(hdr.findall(f".//{W}drawing"), [])
 
 
 if __name__ == "__main__":
