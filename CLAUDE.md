@@ -36,6 +36,10 @@ The output file is named after the **revised** document with its version token b
 
 Gotcha that caused a v7-overwrite bug: the old inline regex used `([vV])(\d+)\b`, but `\b` fails on underscore-separated names (`v7_260718…`) because `_` is a word character — so no token matched and the name came back unchanged, overwriting the source. The helper anchors on the `v` instead (`([vV])(\d+)(?:\.(\d+))?`), so `_`/space/end all work.
 
+## Cloud-only Google Docs (`.gdoc`)
+
+A `.gdoc` is a small JSON shortcut (`{"doc_id": …}`). When Google Drive keeps it "online only" (not opened recently), reading it raises `OSError: [Errno 11] Resource deadlock avoided` — Drive can't serve the dehydrated file synchronously. `gdocExportToDocx` first `open`s the file (which makes Drive download the shortcut and shows the doc in the browser), then **polls the read** for up to 60s until the JSON materializes. The upfront "downloading from cloud storage" step still skips `.gdoc` (it force-downloads Word docs by opening them in Word).
+
 ## Word Compare artifact patterns and clean_redline.py rules
 
 Word Compare produces misalignment artifacts when paragraph counts differ significantly between document versions (e.g., NU adds several paragraphs to a section near a heading). `clean_redline.py` has rules for each pattern observed so far:

@@ -69,7 +69,8 @@ on run {input, parameters}
 
 		-- Open each original in Word to force Google Drive to download it to local disk,
 		-- then close it. Files stored cloud-only aren't available to cp until accessed.
-		-- Skip for .gdoc files — they are already local JSON shortcuts; content is exported separately below.
+		-- Skip for .gdoc files — content is exported separately below. A cloud-only .gdoc is
+		-- materialized in gdocExportToDocx (it opens the file so Drive downloads the shortcut).
 		set currentStage to "downloading documents from cloud storage"
 		display notification "Downloading files from cloud storage..." with title "Redline"
 		if my getExtension(origName) is not "gdoc" then
@@ -392,7 +393,23 @@ end parentDirPOSIX
 -- browser (already authenticated) and waiting for the download to land in ~/Downloads,
 -- then moving it to destPOSIX.
 on gdocExportToDocx(gdocPOSIX, destPOSIX)
-	set docId to do shell script "/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"doc_id\"])' " & quoted form of gdocPOSIX
+	-- A cloud-only .gdoc can't be read until Google Drive materializes it (a raw read of a
+	-- dehydrated file raises OSError [Errno 11] Resource deadlock avoided). Opening the file
+	-- makes Drive download the local shortcut (it also opens the doc in the browser). The
+	-- download is asynchronous, so poll the read until the JSON is available.
+	do shell script "open " & quoted form of gdocPOSIX
+	set docId to ""
+	set _gdocDeadline to (current date) + 60
+	repeat
+		try
+			set docId to do shell script "/usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"doc_id\"])' " & quoted form of gdocPOSIX
+			if docId is not "" then exit repeat
+		on error
+			-- still downloading from cloud storage; keep waiting
+		end try
+		if (current date) > _gdocDeadline then error "Timed out reading Google Doc from cloud storage (is Drive signed in and syncing?): " & gdocPOSIX
+		delay 1
+	end repeat
 	if docId is "" then error "Could not read document ID from " & gdocPOSIX
 	set markerPath to "/tmp/.redline_gdoc_marker"
 	do shell script "touch " & quoted form of markerPath
