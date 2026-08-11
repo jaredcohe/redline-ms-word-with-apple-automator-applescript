@@ -681,6 +681,93 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertEqual(hdr.findall(f".//{W}del"), [])
         self.assertEqual(hdr.findall(f".//{W}drawing"), [])
 
+    def _first_body_p(self, root):
+        return root.find(f"{W}body/{W}p")
+
+    def test_body_paragraph_normalized_to_10pt_and_1_15(self):
+        """A body run at 12pt / single spacing becomes 10pt / 1.15."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:spacing w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>"
+            "<w:r><w:rPr><w:sz w:val=\"24\"/><w:szCs w:val=\"24\"/></w:rPr><w:t>Body.</w:t></w:r></w:p>"
+        )
+        p = self._first_body_p(root)
+        spacing = p.find(f"{W}pPr/{W}spacing")
+        self.assertEqual(spacing.get(f"{W}line"), "276")
+        self.assertEqual(spacing.get(f"{W}lineRule"), "auto")
+        sz = p.find(f".//{W}r/{W}rPr/{W}sz")
+        self.assertEqual(sz.get(f"{W}val"), "20")
+        self.assertEqual(p.find(f".//{W}r/{W}rPr/{W}szCs").get(f"{W}val"), "20")
+
+    def test_inserts_spacing_and_rpr_in_schema_order(self):
+        """spacing lands after pStyle and before jc; run gets an rPr with sz=20; order valid."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:pStyle w:val=\"BodyText\"/><w:jc w:val=\"both\"/></w:pPr>"
+            "<w:r><w:t>Body.</w:t></w:r></w:p>"
+        )
+        p = self._first_body_p(root)
+        order = clean_redline.PPR_ORDER
+        names = [c.tag.split("}")[-1] for c in p.find(f"{W}pPr")]
+        ranks = [order.index(n) for n in names if n in order]
+        self.assertEqual(ranks, sorted(ranks))  # schema order preserved
+        self.assertIn("spacing", names)
+        self.assertEqual(names.index("pStyle") < names.index("spacing") < names.index("jc"), True)
+        run_rpr = p.find(f"{W}r/{W}rPr")
+        self.assertIsNotNone(run_rpr)
+        self.assertEqual(run_rpr.find(f"{W}sz").get(f"{W}val"), "20")
+        # rPr must be the first child of the run
+        self.assertEqual(list(p.find(f"{W}r"))[0].tag, f"{W}rPr")
+
+    def test_heading_size_and_spacing_preserved(self):
+        """Headings keep their own size and spacing."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:r><w:rPr><w:sz w:val=\"28\"/></w:rPr><w:t>Section</w:t></w:r></w:p>"
+        )
+        p = self._first_body_p(root)
+        self.assertEqual(p.find(f".//{W}sz").get(f"{W}val"), "28")
+        self.assertIsNone(p.find(f"{W}pPr/{W}spacing"))
+
+    def test_title_preserved(self):
+        """The document Title is not normalized."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr>"
+            "<w:r><w:rPr><w:sz w:val=\"52\"/></w:rPr><w:t>Agreement</w:t></w:r></w:p>"
+        )
+        p = self._first_body_p(root)
+        self.assertEqual(p.find(f".//{W}sz").get(f"{W}val"), "52")
+
+    def test_table_paragraph_normalized(self):
+        """Body text inside a table is normalized too."""
+        root = clean_fragment(
+            "<w:tbl><w:tr><w:tc>"
+            "<w:p><w:r><w:rPr><w:sz w:val=\"22\"/></w:rPr><w:t>Cell.</w:t></w:r></w:p>"
+            "</w:tc></w:tr></w:tbl>"
+        )
+        sz = root.find(f".//{W}tbl//{W}r/{W}rPr/{W}sz")
+        self.assertEqual(sz.get(f"{W}val"), "20")
+
+    def test_body_formatting_is_idempotent(self):
+        """Running clean twice makes no further change on the second pass."""
+        body = (
+            "<w:p><w:r><w:rPr><w:sz w:val=\"24\"/></w:rPr><w:t>Body.</w:t></w:r></w:p>"
+        )
+        once, _ = clean_redline.clean_document_xml(
+            f"<?xml version=\"1.0\"?><w:document xmlns:w=\"{clean_redline.NAMESPACES['w']}\">"
+            f"<w:body>{body}</w:body></w:document>".encode()
+        )
+        _, changed2 = clean_redline.clean_document_xml(once)
+        self.assertEqual(changed2, 0)
+
+    def test_normalize_body_formatting_skips_header_root(self):
+        """No <w:body> in a header part → normalize returns 0."""
+        hdr = ET.fromstring(
+            f"<w:hdr xmlns:w=\"{clean_redline.NAMESPACES['w']}\">"
+            "<w:p><w:r><w:rPr><w:sz w:val=\"22\"/></w:rPr><w:t>Header.</w:t></w:r></w:p>"
+            "</w:hdr>"
+        )
+        self.assertEqual(clean_redline.normalize_body_formatting(hdr), 0)
+        self.assertEqual(hdr.find(f".//{W}sz").get(f"{W}val"), "22")
+
 
 if __name__ == "__main__":
     unittest.main()

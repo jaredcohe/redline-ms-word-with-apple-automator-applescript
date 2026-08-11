@@ -40,6 +40,10 @@ Gotcha that caused a v7-overwrite bug: the old inline regex used `([vV])(\d+)\b`
 
 A `.gdoc` is a small JSON shortcut (`{"doc_id": …}`). When Google Drive keeps it "online only" (not opened recently), reading it raises `OSError: [Errno 11] Resource deadlock avoided` — Drive can't serve the dehydrated file synchronously. `gdocExportToDocx` first `open`s the file (which makes Drive download the shortcut and shows the doc in the browser), then **polls the read** for up to 60s until the JSON materializes. The upfront "downloading from cloud storage" step still skips `.gdoc` (it force-downloads Word docs by opening them in Word).
 
+## Body formatting normalization (`normalize_body_formatting`)
+
+Every run, `clean_redline.py` forces **body paragraphs to 10pt (`sz`/`szCs val="20"`) and 1.15 line spacing (`spacing line="276" lineRule="auto"`)** as silent (untracked) direct formatting. Applies to normal body + table paragraphs; **skips** headings (`Heading1`–`6`) and `Title`/`Subtitle`, and only the main document (no `<w:body>` in header/footer parts). New `spacing`/`rPr`/`sz` elements are inserted in OOXML schema order via `PPR_ORDER`/`RPR_ORDER` (`_get_or_insert_ordered`) so Word does not flag the file for repair. The pass is idempotent and runs once after the artifact-cleaning loop.
+
 ## Word Compare artifact patterns and clean_redline.py rules
 
 Word Compare produces misalignment artifacts when paragraph counts differ significantly between document versions (e.g., NU adds several paragraphs to a section near a heading). `clean_redline.py` has rules for each pattern observed so far:

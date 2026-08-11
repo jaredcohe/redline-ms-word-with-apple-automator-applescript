@@ -8,6 +8,10 @@ boundaries. This helper keeps substantive revisions but cleans common noise:
   - empty revision wrappers
   - whitespace-only insertions/deletions
   - adjacent insert/delete pairs with identical normalized text
+
+It also normalizes body formatting on every run: body paragraphs (non-heading/title,
+tables included) are forced to 10pt font and 1.15 line spacing via silent direct
+formatting (see normalize_body_formatting).
 """
 
 from __future__ import annotations
@@ -111,6 +115,30 @@ OLE_TAGS = {
     W + "object",
     f"{{{NAMESPACES['o']}}}OLEObject",
 }
+
+# OOXML child-element order (local names) for CT_PPr and CT_RPr. New children must be
+# inserted in this order or Word flags the file for repair.
+PPR_ORDER = (
+    "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr", "widowControl",
+    "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs", "suppressAutoHyphens",
+    "kinsoku", "wordWrap", "overflowPunct", "topLinePunct", "autoSpaceDE", "autoSpaceDN",
+    "bidi", "adjustRightInd", "snapToGrid", "spacing", "ind", "contextualSpacing",
+    "mirrorIndents", "suppressOverlap", "jc", "textDirection", "textAlignment",
+    "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr", "pPrChange",
+)
+RPR_ORDER = (
+    "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike",
+    "outline", "shadow", "emboss", "imprint", "noProof", "snapToGrid", "vanish",
+    "webHidden", "color", "spacing", "w", "kern", "position", "sz", "szCs", "highlight",
+    "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs", "em", "lang",
+    "eastAsianLayout", "specVanish", "oMath",
+)
+
+# Body formatting targets (user house style): 10pt = sz/szCs val="20" (half-points);
+# 1.15 line spacing = spacing line="276" lineRule="auto" (240 * 1.15).
+BODY_FONT_HALF_PT = "20"
+BODY_LINE = "276"
+NON_BODY_STYLES = {"Title", "Subtitle"}
 
 
 def iter_text(element: ET.Element, tag: str) -> Iterable[str]:
@@ -1022,6 +1050,76 @@ def clean_image_revisions(root: ET.Element) -> int:
     return changed
 
 
+def _get_or_insert_ordered(parent: ET.Element, local: str, order: tuple[str, ...]) -> ET.Element:
+    """Return parent's child <w:{local}>, inserting a new one in schema order if absent."""
+    tag = W + local
+    existing = parent.find(tag)
+    if existing is not None:
+        return existing
+    elem = ET.Element(tag)
+    rank = order.index(local)
+    insert_at = len(parent)
+    for i, child in enumerate(parent):
+        name = child.tag.split("}")[-1]
+        if name in order and order.index(name) > rank:
+            insert_at = i
+            break
+    parent.insert(insert_at, elem)
+    return elem
+
+
+def _set_half_point_size(rPr: ET.Element) -> int:
+    """Set w:sz and w:szCs to the body font size on an rPr; return 1 if anything changed."""
+    changed = 0
+    for local in ("sz", "szCs"):
+        el = _get_or_insert_ordered(rPr, local, RPR_ORDER)
+        if el.get(W + "val") != BODY_FONT_HALF_PT:
+            el.set(W + "val", BODY_FONT_HALF_PT)
+            changed = 1
+    return changed
+
+
+def normalize_body_formatting(root: ET.Element) -> int:
+    """Force body paragraphs to 10pt / 1.15 line spacing (silent direct formatting).
+
+    Applies to normal body paragraphs and table paragraphs; skips headings and the
+    Title/Subtitle so their sizes/spacing are preserved. Only touches the main document
+    (there is no <w:body> in header/footer parts). Idempotent — re-running makes no change.
+    """
+    body = root.find(W + "body")
+    if body is None:
+        return 0
+
+    changed = 0
+    for p in body.iter(W + "p"):
+        style = paragraph_style(p)
+        if is_heading_paragraph(p) or (style in NON_BODY_STYLES):
+            continue
+
+        pPr = p.find(W + "pPr")
+        if pPr is None:
+            pPr = ET.Element(W + "pPr")
+            p.insert(0, pPr)  # pPr is always the first child of a paragraph
+        # Line spacing 1.15
+        spacing = _get_or_insert_ordered(pPr, "spacing", PPR_ORDER)
+        if spacing.get(W + "line") != BODY_LINE or spacing.get(W + "lineRule") != "auto":
+            spacing.set(W + "line", BODY_LINE)
+            spacing.set(W + "lineRule", "auto")
+            changed = 1
+        # Paragraph-mark font size (empty body lines render at 10pt too)
+        mark_rPr = _get_or_insert_ordered(pPr, "rPr", PPR_ORDER)
+        changed |= _set_half_point_size(mark_rPr)
+        # Every run's font size
+        for r in p.iter(W + "r"):
+            run_rPr = r.find(W + "rPr")
+            if run_rPr is None:
+                run_rPr = ET.Element(W + "rPr")
+                r.insert(0, run_rPr)  # rPr is always the first child of a run
+            changed |= _set_half_point_size(run_rPr)
+
+    return 1 if changed else 0
+
+
 def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
     root = ET.fromstring(xml_bytes)
     changed_ignorable = clean_ignorable_namespaces(root)
@@ -1042,6 +1140,7 @@ def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
         if changed == 0:
             break
         total_changed += changed
+    total_changed += normalize_body_formatting(root)
     return ET.tostring(root, encoding="utf-8", xml_declaration=True), total_changed + changed_ignorable
 
 
