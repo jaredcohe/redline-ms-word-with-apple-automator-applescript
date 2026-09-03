@@ -173,8 +173,12 @@ class CleanRedlineTests(unittest.TestCase):
             "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr></w:p>"
         )
 
-        paras = root.findall(f".//{W}p")
-        heading_p = paras[2]
+        # The emptied source paragraph is now a leading blank and gets removed, so find the
+        # heading by style rather than by position.
+        heading_p = next(
+            p for p in root.findall(f".//{W}p")
+            if clean_redline.paragraph_style(p) == "Heading1"
+        )
 
         self.assertIsNotNone(heading_p.find(f".//{W}ins"))
         self.assertEqual(
@@ -592,7 +596,7 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertIsNotNone(body.find(f"{W}sectPr"))
 
     def test_cosmetic_section_break_removal_preserves_bookmark(self):
-        """An empty break-only paragraph keeps its bookmark; only the sectPr is removed."""
+        """The body's only paragraph is never deleted, so its bookmark stays put."""
         root = clean_fragment(
             "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr>"
             "<w:bookmarkStart w:id=\"5\" w:name=\"_Ref1\"/><w:bookmarkEnd w:id=\"5\"/></w:p>"
@@ -602,6 +606,81 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertIsNone(body.find(f"{W}p/{W}pPr/{W}sectPr"))
         self.assertIsNotNone(body.find(f".//{W}bookmarkStart"))
         self.assertEqual(len(body.findall(f"{W}p")), 1)
+
+    def test_removes_empty_section_break_host_paragraph(self):
+        """The blank paragraph that carried a cosmetic break goes with it (issue: a stray
+        blank line above the next heading)."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>Body one.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"BodyText\"/>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:r><w:t>Definitions</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        paras = body.findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertEqual("".join(paras[1].itertext()), "Definitions")
+
+    def test_section_break_host_removal_relocates_bookmark(self):
+        """A break host that only anchors a bookmark is removed, the mark moving forward."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>Body one.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr>"
+            "<w:bookmarkStart w:id=\"5\" w:name=\"_Ref1\"/><w:bookmarkEnd w:id=\"5\"/></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:r><w:t>Definitions</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        paras = body.findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        heading = paras[1]
+        self.assertEqual(heading.find(f"{W}bookmarkStart").get(f"{W}name"), "_Ref1")
+        self.assertIsNotNone(heading.find(f"{W}bookmarkEnd"))
+
+    def test_keeps_section_break_host_that_has_text(self):
+        """Only a pure spacer is deleted; a break host with text keeps its paragraph."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr>"
+            "<w:r><w:t>End of section one.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        self.assertEqual(len(body.findall(f"{W}p")), 2)
+
+    def test_keeps_section_break_host_between_two_tables(self):
+        """Removing a paragraph between two tables would splice them; keep it."""
+        table = (
+            "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>{}</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        )
+        root = clean_fragment(
+            table.format("first")
+            + "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr></w:p>"
+            + table.format("second")
+            + "<w:p><w:r><w:t>After.</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        self.assertEqual(len(body.findall(f"{W}tbl")), 2)
+        self.assertIsNone(body.find(f"{W}p/{W}pPr/{W}sectPr"))
+        # The separator paragraph survives between the two tables.
+        self.assertEqual([child.tag for child in body][1], f"{W}p")
+
+    def test_keeps_section_break_host_that_is_cells_last_paragraph(self):
+        """A table cell must retain a paragraph, so its only one is never removed."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>Before.</w:t></w:r></w:p>"
+            "<w:tbl><w:tr><w:tc>"
+            "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr></w:p>"
+            "</w:tc></w:tr></w:tbl>"
+            "<w:p><w:r><w:t>After.</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}tc/{W}p"))
+        self.assertIsNone(root.find(f".//{W}tc/{W}p/{W}pPr/{W}sectPr"))
 
     def test_preserves_landscape_section_break(self):
         """A section break that changes page orientation/size is genuine; keep it."""
@@ -767,6 +846,562 @@ class CleanRedlineTests(unittest.TestCase):
         )
         self.assertEqual(clean_redline.normalize_body_formatting(hdr), 0)
         self.assertEqual(hdr.find(f".//{W}sz").get(f"{W}val"), "22")
+
+
+    # --- Revision markers in property containers ----------------------------------------
+
+    def test_preserves_tracked_paragraph_mark(self):
+        """A deleted paragraph mark carries no text by design, so the empty-wrapper rule
+        must not prune it — otherwise a real "this break was removed" edit disappears and
+        cannot be rejected."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:rPr>"
+            "<w:del w:id=\"4\" w:author=\"NU\" w:date=\"2026-01-01T00:00:00Z\"/>"
+            "</w:rPr></w:pPr><w:r><w:t>Para one</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Para two</w:t></w:r></w:p>"
+        )
+        first = root.find(f"{W}body/{W}p")
+        self.assertTrue(clean_redline.paragraph_mark_has_revision(first))
+
+    def test_preserves_inserted_table_row_marker(self):
+        """<w:ins> in a <w:trPr> marks an inserted row; it is a marker, not a wrapper."""
+        root = clean_fragment(
+            "<w:tbl><w:tr><w:trPr><w:ins w:id=\"5\" w:author=\"NU\"/></w:trPr>"
+            "<w:tc><w:p><w:r><w:t>New row</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}trPr/{W}ins"))
+
+    # --- Inserted vs deleted paragraph marks --------------------------------------------
+    #
+    # Real Word Compare output marks a converted revision's layout noise as *inserted*
+    # paragraph marks (12 of them in the Atlas comparison). Deleting such a paragraph is
+    # what Reject does to it, so the spacer rules may remove it; a *deleted* mark is the
+    # reviewer's to accept and must survive.
+
+    MARK_INS = "<w:pPr><w:rPr><w:ins w:id=\"90\" w:author=\"NU\"/></w:rPr></w:pPr>"
+    MARK_DEL = "<w:pPr><w:rPr><w:del w:id=\"91\" w:author=\"NU\"/></w:rPr></w:pPr>"
+
+    def test_paragraph_mark_revision_reports_direction(self):
+        ins = ET.fromstring(
+            f"<w:p xmlns:w=\"{clean_redline.NAMESPACES['w']}\">{self.MARK_INS}</w:p>"
+        )
+        dele = ET.fromstring(
+            f"<w:p xmlns:w=\"{clean_redline.NAMESPACES['w']}\">{self.MARK_DEL}</w:p>"
+        )
+        plain = ET.fromstring(f"<w:p xmlns:w=\"{clean_redline.NAMESPACES['w']}\"/>")
+        self.assertEqual(clean_redline.paragraph_mark_revision(ins), clean_redline.INS)
+        self.assertEqual(clean_redline.paragraph_mark_revision(dele), clean_redline.DEL)
+        self.assertIsNone(clean_redline.paragraph_mark_revision(plain))
+        # An inserted mark is rejectable; a deleted one is not.
+        self.assertTrue(clean_redline.is_rejectable_spacer_paragraph(ins))
+        self.assertFalse(clean_redline.is_rejectable_spacer_paragraph(dele))
+        # Neither counts as an untracked spacer.
+        self.assertFalse(clean_redline.is_spacer_paragraph(ins))
+        self.assertFalse(clean_redline.is_spacer_paragraph(dele))
+
+    def test_removes_leading_blank_with_inserted_paragraph_mark(self):
+        """The real artifact: the blank above the title arrives as an inserted mark."""
+        root = clean_fragment(
+            self.LOGO_P
+            + f"<w:p>{self.MARK_INS}</w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr>"
+            "<w:r><w:t>Agreement</w:t></w:r></w:p>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertIsNotNone(paras[0].find(f".//{W}drawing"))
+
+    def test_removes_section_break_host_with_inserted_paragraph_mark(self):
+        """Same for the spacer that carried a cosmetic section break."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>Body one.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:rPr><w:ins w:id=\"90\" w:author=\"NU\"/></w:rPr>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:r><w:t>Definitions</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertEqual("".join(paras[1].itertext()), "Definitions")
+
+    def test_keeps_section_break_host_with_deleted_paragraph_mark(self):
+        """A deleted mark is the reviewer's call — do not pre-empt it."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>Body one.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:rPr><w:del w:id=\"91\" w:author=\"NU\"/></w:rPr>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr></w:pPr></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:r><w:t>Definitions</w:t></w:r></w:p>"
+            "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>"
+        )
+        body = root.find(f"{W}body")
+        self.assertEqual(len(body.findall(f"{W}p")), 3)
+        self.assertIsNotNone(body.find(f".//{W}rPr/{W}del"))
+        # The cosmetic sectPr still goes; only the paragraph is spared.
+        self.assertIsNone(body.find(f"{W}p/{W}pPr/{W}sectPr"))
+
+    def test_removes_stray_table_marked_wholly_inserted(self):
+        """The split-off table's cells carry inserted marks; rejecting them drops it."""
+        root = clean_fragment(
+            self.SIG_TABLE.format(
+                "<w:del w:id=\"1\"><w:r><w:delText>Address:  Greenwich, CT</w:delText>"
+                "</w:r></w:del>"
+            )
+            + "<w:p/>"
+            "<w:tbl><w:tr><w:tc>"
+            f"<w:p>{self.MARK_INS}"
+            "<w:ins w:id=\"2\"><w:r><w:t>Address: Greenwich, CT</w:t></w:r></w:ins>"
+            "</w:p></w:tc></w:tr></w:tbl>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}tbl")), 1)
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+
+    def test_keeps_stray_table_marked_deleted(self):
+        """A table the revision *deletes* stays visible as a deletion."""
+        root = clean_fragment(
+            self.SIG_TABLE.format(
+                "<w:del w:id=\"1\"><w:r><w:delText>Address:  Greenwich, CT</w:delText>"
+                "</w:r></w:del>"
+            )
+            + "<w:p/>"
+            "<w:tbl><w:tr><w:tc>"
+            f"<w:p>{self.MARK_DEL}"
+            "<w:ins w:id=\"2\"><w:r><w:t>Address: Greenwich, CT</w:t></w:r></w:ins>"
+            "</w:p></w:tc></w:tr></w:tbl>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}tbl")), 2)
+
+    def test_merges_split_sentence_across_inserted_mark_spacer(self):
+        """The blank between the halves carries an inserted mark in real output."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>…the expiration or termination</w:t></w:r></w:p>"
+            + f"<w:p>{self.MARK_INS}</w:p>"
+            + "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 1)
+        self.assertEqual(
+            "".join(paras[0].itertext()), "…the expiration or termination of this Agreement."
+        )
+
+    def test_does_not_merge_when_second_mark_is_deleted(self):
+        """A deleted mark on the trailing half is a real edit; leave it visible."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>…the expiration or termination</w:t></w:r></w:p>"
+            + f"<w:p>{self.MARK_DEL}<w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    def test_ignorable_namespace_pruning_converges_in_one_pass(self):
+        """Removing a revision orphans the prefix it used, so the mc:Ignorable prune has to
+        run after the cleaning loop — otherwise the workflow's second run rewrites the file."""
+        xml = (
+            "<?xml version=\"1.0\"?>"
+            f"<w:document xmlns:w=\"{clean_redline.NAMESPACES['w']}\" "
+            f"xmlns:mc=\"{clean_redline.NAMESPACES['mc']}\" "
+            f"xmlns:w16du=\"{clean_redline.NAMESPACES['w16du']}\" "
+            "mc:Ignorable=\"w16du\"><w:body>"
+            "<w:p><w:ins w:id=\"1\" w16du:dateUtc=\"2026-01-01T00:00:00Z\"/></w:p>"
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "</w:body></w:document>"
+        ).encode()
+        once, _ = clean_redline.clean_document_xml(xml)
+        self.assertNotIn(b"w16du", once.split(b"<w:body>")[0])
+        _, changed = clean_redline.clean_document_xml(once)
+        self.assertEqual(changed, 0)
+
+    # --- Hyperlink revisions (a signature block's e-mail shown as edited) ---------------
+
+    def test_collapses_spacing_only_pair_around_hyperlink_field(self):
+        """Word Compare rebuilds a mailto HYPERLINK field, so an unchanged e-mail shows as
+        insert+delete differing only in whitespace. Accept the insertion, field and all."""
+        root = clean_fragment(
+            "<w:p>"
+            "<w:ins w:id=\"1\">"
+            "<w:r><w:t>Email:</w:t></w:r>"
+            "<w:r><w:t xml:space=\"preserve\"> </w:t></w:r>"
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>"
+            "<w:r><w:instrText>HYPERLINK \"mailto:ops@nusearch.com\" \\h</w:instrText></w:r>"
+            "<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>"
+            "<w:r><w:t>ops@nusearch.com</w:t></w:r>"
+            "<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
+            "</w:ins>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Email:  ops@nusearch.com</w:delText></w:r></w:del>"
+            "</w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        # The hyperlink field is preserved verbatim, not flattened to plain text.
+        self.assertEqual(len(root.findall(f".//{W}fldChar")), 3)
+        self.assertIsNotNone(root.find(f".//{W}instrText"))
+        self.assertIn("ops@nusearch.com", "".join(root.itertext()))
+
+    def test_collapses_spacing_only_pair_around_hyperlink_element(self):
+        """Same no-op built with <w:hyperlink r:id> instead of a field."""
+        root = clean_fragment(
+            "<w:p>"
+            "<w:ins w:id=\"1\"><w:hyperlink r:id=\"rId9\">"
+            "<w:r><w:t>ops@nusearch.com</w:t></w:r></w:hyperlink></w:ins>"
+            "<w:del w:id=\"2\"><w:r><w:delText>ops@nusearch.com </w:delText></w:r></w:del>"
+            "</w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertEqual(root.find(f".//{W}hyperlink").get(f"{R}id"), "rId9")
+
+    def test_preserves_pair_when_revision_holds_a_content_control(self):
+        """Only hyperlinks are tolerated — an SDT still blocks the pair collapse."""
+        root = clean_fragment(
+            "<w:p>"
+            "<w:ins w:id=\"1\"><w:sdt><w:sdtContent>"
+            "<w:r><w:t>Client name</w:t></w:r></w:sdtContent></w:sdt></w:ins>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Client name</w:delText></w:r></w:del>"
+            "</w:p>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}ins"))
+        self.assertIsNotNone(root.find(f".//{W}del"))
+
+    def test_preserves_pair_when_revision_holds_an_ole_object(self):
+        """An embedded OLE object is not hyperlink machinery; leave the revision alone."""
+        root = clean_fragment(
+            "<w:p>"
+            "<w:ins w:id=\"1\"><w:r><w:object><o:OLEObject r:id=\"rId5\"/></w:object>"
+            "<w:t>Schedule</w:t></w:r></w:ins>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Schedule</w:delText></w:r></w:del>"
+            "</w:p>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}ins"))
+        self.assertIsNotNone(root.find(f".//{O}OLEObject"))
+
+    def test_preserves_pair_when_insertion_holds_a_bookmark(self):
+        """Bookmarks stay protected: a revision anchoring one is not collapsed."""
+        root = clean_fragment(
+            "<w:p>"
+            "<w:ins w:id=\"1\"><w:bookmarkStart w:id=\"9\" w:name=\"_Ref9\"/>"
+            "<w:r><w:t>Fees</w:t></w:r></w:ins>"
+            "<w:del w:id=\"2\"><w:r><w:delText>Fees</w:delText></w:r></w:del>"
+            "</w:p>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}ins"))
+        self.assertIsNotNone(root.find(f".//{W}bookmarkStart"))
+
+    # --- Leading blank paragraphs above the title ---------------------------------------
+
+    LOGO_P = (
+        "<w:p><w:pPr><w:ind w:left=\"3870\"/></w:pPr>"
+        "<w:r><w:drawing r:embed=\"rId7\"/></w:r></w:p>"
+    )
+
+    def test_removes_leading_blank_paragraphs_above_title(self):
+        """Compare keeps both documents' title spacers; fold them into the logo paragraph."""
+        root = clean_fragment(
+            self.LOGO_P
+            + "<w:p><w:pPr><w:pStyle w:val=\"BodyText\"/>"
+            "<w:spacing w:before=\"245\"/></w:pPr></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Title\"/><w:spacing w:after=\"320\"/></w:pPr></w:p>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr>"
+            "<w:r><w:t>Retained Search Services Agreement</w:t></w:r></w:p>"
+        )
+        body = root.find(f"{W}body")
+        paras = body.findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertIsNotNone(paras[0].find(f".//{W}drawing"))
+        self.assertEqual("".join(paras[1].itertext()), "Retained Search Services Agreement")
+        # The largest `after` among the removed spacers moves onto the logo paragraph.
+        self.assertEqual(paras[0].find(f"{W}pPr/{W}spacing").get(f"{W}after"), "320")
+
+    def test_leading_blank_removal_defaults_the_title_gap(self):
+        """Spacers with no explicit `after` still leave TITLE_GAP_AFTER of space."""
+        root = clean_fragment(
+            self.LOGO_P
+            + "<w:p/>"
+            "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr>"
+            "<w:r><w:t>Agreement</w:t></w:r></w:p>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertEqual(
+            paras[0].find(f"{W}pPr/{W}spacing").get(f"{W}after"),
+            clean_redline.TITLE_GAP_AFTER,
+        )
+
+    def test_leading_blank_removal_relocates_bookmarks(self):
+        """A leading spacer's bookmark moves to the first text paragraph."""
+        root = clean_fragment(
+            self.LOGO_P
+            + "<w:p><w:bookmarkStart w:id=\"3\" w:name=\"_Title\"/>"
+            "<w:bookmarkEnd w:id=\"3\"/></w:p>"
+            "<w:p><w:r><w:t>Agreement</w:t></w:r></w:p>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertEqual(paras[1].find(f"{W}bookmarkStart").get(f"{W}name"), "_Title")
+
+    def test_preserves_leading_paragraph_holding_the_logo(self):
+        """The logo paragraph has no text but is not a spacer; it bounds the scan."""
+        root = clean_fragment(self.LOGO_P + "<w:p><w:r><w:t>Agreement</w:t></w:r></w:p>")
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 2)
+        self.assertIsNotNone(paras[0].find(f".//{W}drawing"))
+
+    def test_keeps_leading_blank_with_tracked_paragraph_mark(self):
+        """A blank whose paragraph mark is itself a tracked change is a real edit."""
+        root = clean_fragment(
+            self.LOGO_P
+            + "<w:p><w:pPr><w:rPr><w:del w:id=\"4\"/></w:rPr></w:pPr></w:p>"
+            "<w:p><w:r><w:t>Agreement</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 3)
+
+    def test_document_starting_with_text_is_untouched(self):
+        """No leading spacers, nothing to do — and no spacing is invented."""
+        root = clean_fragment("<w:p><w:r><w:t>Agreement</w:t></w:r></w:p>")
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 1)
+        spacing = paras[0].find(f"{W}pPr/{W}spacing")
+        self.assertIsNone(spacing.get(f"{W}after"))
+
+    def test_leading_blank_removal_is_idempotent(self):
+        """A second clean of the same bytes reports no further change."""
+        once, _ = clean_redline.clean_document_xml(
+            f"<?xml version=\"1.0\"?><w:document xmlns:w=\"{clean_redline.NAMESPACES['w']}\" "
+            f"xmlns:r=\"{clean_redline.NAMESPACES['r']}\"><w:body>"
+            f"{self.LOGO_P}<w:p/><w:p/>"
+            "<w:p><w:r><w:t>Agreement</w:t></w:r></w:p>"
+            "</w:body></w:document>".encode()
+        )
+        _, changed = clean_redline.clean_document_xml(once)
+        self.assertEqual(changed, 0)
+
+    # --- Sentences the conversion split across paragraphs -------------------------------
+
+    def test_merges_sentence_split_across_paragraphs(self):
+        """A paragraph stopping mid-sentence rejoins the lower-case one that follows."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>…including after the expiration or termination</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>of this Agreement. To be clear, Client pays.</w:t></w:r></w:p>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 1)
+        self.assertEqual(
+            "".join(paras[0].itertext()),
+            "…including after the expiration or termination "
+            "of this Agreement. To be clear, Client pays.",
+        )
+
+    def test_merges_sentence_split_across_two_blank_paragraphs(self):
+        """The conversion leaves blanks where the page furniture sat; cross up to two."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>…the expiration or termination</w:t></w:r></w:p>"
+            "<w:p/><w:p/>"
+            "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 1)
+        self.assertEqual(
+            "".join(paras[0].itertext()), "…the expiration or termination of this Agreement."
+        )
+
+    def test_does_not_merge_across_three_blank_paragraphs(self):
+        """Three blanks is a deliberate gap, not a split sentence."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>…the expiration or termination</w:t></w:r></w:p>"
+            "<w:p/><w:p/><w:p/>"
+            "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 5)
+
+    def test_does_not_merge_when_next_paragraph_starts_uppercase(self):
+        """A new sentence starts a new paragraph; never merge those."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>NU will perform the Services in good faith</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>Client will pay all fees when due.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    def test_does_not_merge_when_next_paragraph_starts_with_a_quote(self):
+        """Definition paragraphs open with a curly quote, not a lower-case letter."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>The following terms apply</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>\u201cCandidate\u201d means any person.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    def test_does_not_merge_when_first_paragraph_ends_in_punctuation(self):
+        """A finished sentence was not split."""
+        root = clean_fragment(
+            "<w:p><w:r><w:t>NU will perform the Services.</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    def test_does_not_merge_a_heading(self):
+        """Headings never join running text, even ending without punctuation."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr>"
+            "<w:r><w:t>Fees and Payment Schedule</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    def test_does_not_merge_numbered_paragraphs(self):
+        """List items are separate blocks however they end."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:numPr><w:numId w:val=\"3\"/></w:numPr></w:pPr>"
+            "<w:r><w:t>Checking references as appropriate</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    def test_does_not_merge_paragraphs_inside_a_table(self):
+        """Only direct children of <w:body> merge, so cell text is safe."""
+        root = clean_fragment(
+            "<w:tbl><w:tr><w:tc>"
+            "<w:p><w:r><w:t>Payment due on the</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>first business day.</w:t></w:r></w:p>"
+            "</w:tc></w:tr></w:tbl>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}tc/{W}p")), 2)
+
+    def test_does_not_merge_when_paragraph_mark_is_tracked(self):
+        """A tracked paragraph mark is a real edit — the reviewer must see it."""
+        root = clean_fragment(
+            "<w:p><w:pPr><w:rPr><w:del w:id=\"7\"/></w:rPr></w:pPr>"
+            "<w:r><w:t>…the expiration or termination</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>of this Agreement.</w:t></w:r></w:p>"
+        )
+        self.assertEqual(len(root.find(f"{W}body").findall(f"{W}p")), 2)
+
+    # --- No-ops Word Compare spread across a table boundary -----------------------------
+
+    SIG_TABLE = (
+        "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>Email: ops@nusearch.com</w:t></w:r></w:p></w:tc>"
+        "</w:tr><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl>"
+    )
+
+    def test_collapses_relocated_row_across_tables(self):
+        """The revised file split the signature table, so Compare claimed the address moved.
+        Keep it where it was and drop the emptied second table."""
+        root = clean_fragment(
+            self.SIG_TABLE.format(
+                "<w:del w:id=\"1\"><w:r><w:delText>Address:  Greenwich, CT</w:delText>"
+                "</w:r></w:del>"
+            )
+            + "<w:p/>"
+            "<w:tbl><w:tr><w:tc><w:p>"
+            "<w:ins w:id=\"2\"><w:r><w:t>Address: Greenwich, CT</w:t></w:r></w:ins>"
+            "</w:p></w:tc></w:tr></w:tbl>"
+        )
+        tables = root.findall(f".//{W}tbl")
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertIn("Address:  Greenwich, CT", "".join(tables[0].itertext()))
+
+    def test_keeps_second_table_holding_other_text(self):
+        """Only a table this rule empties is removed."""
+        root = clean_fragment(
+            self.SIG_TABLE.format(
+                "<w:del w:id=\"1\"><w:r><w:delText>Address:  Greenwich, CT</w:delText>"
+                "</w:r></w:del>"
+            )
+            + "<w:p/>"
+            "<w:tbl><w:tr>"
+            "<w:tc><w:p><w:r><w:t>Keep me.</w:t></w:r></w:p></w:tc>"
+            "<w:tc><w:p><w:ins w:id=\"2\"><w:r><w:t>Address: Greenwich, CT</w:t></w:r>"
+            "</w:ins></w:p></w:tc>"
+            "</w:tr></w:tbl>"
+        )
+        self.assertEqual(len(root.findall(f".//{W}tbl")), 2)
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertIn("Keep me.", "".join(root.itertext()))
+
+    def test_relocated_table_noop_requires_matching_text(self):
+        """A genuinely different insertion in the next table is a real edit."""
+        root = clean_fragment(
+            self.SIG_TABLE.format(
+                "<w:del w:id=\"1\"><w:r><w:delText>Address:  Greenwich, CT</w:delText>"
+                "</w:r></w:del>"
+            )
+            + "<w:p/>"
+            "<w:tbl><w:tr><w:tc><w:p>"
+            "<w:ins w:id=\"2\"><w:r><w:t>Address: Stamford, CT</w:t></w:r></w:ins>"
+            "</w:p></w:tc></w:tr></w:tbl>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}ins"))
+        self.assertIsNotNone(root.find(f".//{W}del"))
+
+    def test_relocated_noop_needs_a_table_boundary(self):
+        """Plain adjacent body paragraphs stay the existing cross-paragraph rule's job."""
+        root = clean_fragment(
+            "<w:p><w:del w:id=\"1\"><w:r><w:delText>Moved text</w:delText></w:r></w:del></w:p>"
+            "<w:p><w:ins w:id=\"2\"><w:r><w:t>Moved text</w:t></w:r></w:ins></w:p>"
+        )
+        # clean_cross_paragraph_noops resolves this one by keeping the insertion.
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertIn("Moved text", "".join(root.itertext()))
+
+    # --- Header/footer text flattened into the body -------------------------------------
+
+    @staticmethod
+    def _doc_and_footer(body: str, footer: str):
+        ns = (
+            f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\" "
+            f"xmlns:r=\"{clean_redline.NAMESPACES['r']}\""
+        )
+        doc = ET.fromstring(f"<w:document {ns}><w:body>{body}</w:body></w:document>")
+        ftr = ET.fromstring(f"<w:ftr {ns}>{footer}</w:ftr>")
+        return doc, ftr
+
+    def test_restores_footer_text_flattened_into_body(self):
+        """The revised file had no footer parts, so Compare deleted the footer's text and
+        re-inserted it mid-body. Put it back in the footer and drop the body insertion."""
+        doc, ftr = self._doc_and_footer(
+            "<w:p><w:r><w:t>Body text.</w:t></w:r></w:p>"
+            "<w:p><w:ins w:id=\"1\"><w:r><w:t>ID:5155</w:t></w:r></w:ins></w:p>"
+            "<w:p><w:r><w:t>More body text.</w:t></w:r></w:p>",
+            "<w:p><w:del w:id=\"2\"><w:r><w:delText>ID:5155</w:delText></w:r></w:del></w:p>",
+        )
+        counts = clean_redline.clean_header_footer_relocations(
+            doc, {"word/footer4.xml": ftr}
+        )
+
+        self.assertEqual(counts["word/footer4.xml"], 1)
+        self.assertEqual(ftr.findall(f".//{W}del"), [])
+        self.assertEqual("".join(ftr.itertext()), "ID:5155")
+        self.assertEqual(doc.findall(f".//{W}ins"), [])
+        self.assertNotIn("ID:5155", "".join(doc.itertext()))
+        # The emptied body paragraph goes too, rather than leaving a blank line.
+        self.assertEqual(len(doc.findall(f".//{W}p")), 2)
+
+    def test_leaves_footer_deletion_without_a_matching_body_insertion(self):
+        """A footer the author really did delete stays deleted."""
+        doc, ftr = self._doc_and_footer(
+            "<w:p><w:r><w:t>Body text.</w:t></w:r></w:p>",
+            "<w:p><w:del w:id=\"2\"><w:r><w:delText>ID:5155</w:delText></w:r></w:del></w:p>",
+        )
+        counts = clean_redline.clean_header_footer_relocations(
+            doc, {"word/footer4.xml": ftr}
+        )
+
+        self.assertEqual(counts, {})
+        self.assertIsNotNone(ftr.find(f".//{W}del"))
+
+    def test_footer_relocation_requires_matching_text(self):
+        """A body insertion of different text is a real edit, not the moved footer."""
+        doc, ftr = self._doc_and_footer(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:t>ID:9999</w:t></w:r></w:ins></w:p>",
+            "<w:p><w:del w:id=\"2\"><w:r><w:delText>ID:5155</w:delText></w:r></w:del></w:p>",
+        )
+        counts = clean_redline.clean_header_footer_relocations(
+            doc, {"word/footer4.xml": ftr}
+        )
+
+        self.assertEqual(counts, {})
+        self.assertIsNotNone(doc.find(f".//{W}ins"))
+        self.assertIsNotNone(ftr.find(f".//{W}del"))
 
 
 if __name__ == "__main__":

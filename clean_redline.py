@@ -79,6 +79,7 @@ DEL = W + "del"
 TEXT = W + "t"
 DEL_TEXT = W + "delText"
 IGNORABLE = MC + "Ignorable"
+XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 URI_TO_PREFIX = {uri: prefix for prefix, uri in NAMESPACES.items()}
 CHECKBOX_CHARS = {"☐", "☒"}
 
@@ -98,6 +99,35 @@ PROTECTED_TAGS = {
     f"{{{NAMESPACES['v']}}}shape",
     f"{{{NAMESPACES['v']}}}imagedata",
     f"{{{NAMESPACES['o']}}}OLEObject",
+}
+
+# Hyperlink machinery. These appear in PROTECTED_TAGS because they must never be *dropped*,
+# but a revision whose only "protected" content is a hyperlink is still safe to resolve by
+# ACCEPTING it (accepted_children deep-copies the field verbatim). See is_textlike_revision.
+HYPERLINK_TAGS = {
+    W + "fldChar",
+    W + "instrText",
+    W + "fldSimple",
+    W + "hyperlink",
+}
+
+# Bookmarks are protected because they must not be dropped, but a paragraph that only
+# anchors bookmarks can still be removed once its marks are relocated to a neighbour.
+BOOKMARK_TAGS = {
+    W + "bookmarkStart",
+    W + "bookmarkEnd",
+}
+
+# Property containers where a bare <w:ins>/<w:del> is a revision *marker*, not a wrapper
+# around content: a tracked paragraph mark (pPr/rPr), or an inserted/deleted table row or
+# cell. These are legitimately empty and must never be pruned as empty revision wrappers,
+# or a real "this paragraph break was deleted" edit vanishes un-rejectably.
+REVISION_MARKER_PARENTS = {
+    W + "rPr",
+    W + "trPr",
+    W + "tcPr",
+    W + "tblPr",
+    W + "tblPrEx",
 }
 
 # Elements that represent an embedded picture (the logo). A tracked change whose only
@@ -139,6 +169,14 @@ RPR_ORDER = (
 BODY_FONT_HALF_PT = "20"
 BODY_LINE = "276"
 NON_BODY_STYLES = {"Title", "Subtitle"}
+
+# Space kept above the document title when the leading spacer paragraphs are removed
+# (16pt = the original template's Title/@w:after). See clean_leading_empty_paragraphs.
+TITLE_GAP_AFTER = "320"
+
+# How far apart (in flattened document order) a relocated deletion and its matching
+# insertion may sit. See clean_relocated_table_noops.
+RELOCATION_WINDOW = 4
 
 
 def iter_text(element: ET.Element, tag: str) -> Iterable[str]:
@@ -185,6 +223,37 @@ def has_protected_content(element: ET.Element) -> bool:
 
 def is_text_only_revision(element: ET.Element) -> bool:
     return is_revision(element) and not has_protected_content(element)
+
+
+def is_textlike_revision(element: ET.Element) -> bool:
+    """Like is_text_only_revision, but tolerates hyperlinks (fields or <w:hyperlink>).
+
+    Word Compare re-emits a mailto/URL hyperlink as an insert+delete pair whenever the two
+    documents build the link differently (a HYPERLINK field vs. a <w:hyperlink> element), so
+    a signature block's e-mail address shows as edited when only its whitespace changed.
+    Such a revision is safe to resolve *by accepting the insertion*, because
+    accepted_children deep-copies the whole field/hyperlink verbatim — nothing is lost.
+
+    Everything else in PROTECTED_TAGS still blocks: drawings, OLE objects, tables, content
+    controls, bookmarks and comment anchors. Relationship references are allowed only when
+    they hang off a <w:hyperlink> (an image's r:embed still blocks).
+    """
+    if not is_revision(element):
+        return False
+
+    blocking = PROTECTED_TAGS - HYPERLINK_TAGS
+    for node in element.iter():
+        if node.tag in blocking:
+            return False
+
+    hyperlink_ids = {id(node) for node in element.iter(W + "hyperlink")}
+    for node in element.iter():
+        if id(node) in hyperlink_ids:
+            continue
+        for attr_name, value in node.attrib.items():
+            if value and attr_name.startswith(R):
+                return False
+    return True
 
 
 def is_unlinked_drawing_revision(element: ET.Element) -> bool:
@@ -309,6 +378,12 @@ def clean_parent(parent: ET.Element) -> int:
             i += 1
             continue
 
+        # A revision inside a property container marks the paragraph mark / row / cell
+        # itself. It carries no text by design, so none of the wrapper rules below apply.
+        if parent.tag in REVISION_MARKER_PARENTS:
+            i += 1
+            continue
+
         text = revision_text(child)
         if text == "":
             if is_unlinked_drawing_revision(child):
@@ -356,8 +431,8 @@ def clean_parent(parent: ET.Element) -> int:
             sibling = parent[i + 1]
             sibling_text = revision_text(sibling)
             if (
-                is_text_only_revision(child)
-                and is_text_only_revision(sibling)
+                is_textlike_revision(child)
+                and is_textlike_revision(sibling)
                 and norm(text)
                 and same_text_or_spacing_only(text, sibling_text)
                 and child.tag != sibling.tag
@@ -811,15 +886,29 @@ def clean_heading_full_ins_noop(root: ET.Element) -> int:
     return changed
 
 
-def paragraph_mark_has_revision(p: ET.Element) -> bool:
-    """True if the paragraph mark itself is a tracked change (w:pPr/w:rPr/w:ins|w:del)."""
+def paragraph_mark_rPr(p: ET.Element) -> ET.Element | None:
+    """The paragraph mark's own run properties (w:pPr/w:rPr), if present."""
     pPr = p.find(W + "pPr")
     if pPr is None:
-        return False
-    rPr = pPr.find(W + "rPr")
+        return None
+    return pPr.find(W + "rPr")
+
+
+def paragraph_mark_revision(p: ET.Element) -> str | None:
+    """INS or DEL if the paragraph mark itself is a tracked change, else None."""
+    rPr = paragraph_mark_rPr(p)
     if rPr is None:
-        return False
-    return rPr.find(INS) is not None or rPr.find(DEL) is not None
+        return None
+    if rPr.find(INS) is not None:
+        return INS
+    if rPr.find(DEL) is not None:
+        return DEL
+    return None
+
+
+def paragraph_mark_has_revision(p: ET.Element) -> bool:
+    """True if the paragraph mark itself is a tracked change (w:pPr/w:rPr/w:ins|w:del)."""
+    return paragraph_mark_revision(p) is not None
 
 
 def clean_empty_list_paragraphs(root: ET.Element) -> int:
@@ -959,6 +1048,101 @@ def clean_trailing_heading_ins_del_noop(root: ET.Element) -> int:
     return changed
 
 
+def build_parent_map(root: ET.Element) -> dict[int, ET.Element]:
+    """Map id(element) -> parent for every descendant (ElementTree has no parent pointers)."""
+    parents: dict[int, ET.Element] = {}
+    for parent in root.iter():
+        for child in parent:
+            parents[id(child)] = parent
+    return parents
+
+
+def visible_text(p: ET.Element) -> str:
+    """The text a reader sees: unchanged runs plus insertions, but not deleted runs."""
+    return "".join(iter_text(p, TEXT))
+
+
+def _is_contentless_paragraph(p: ET.Element) -> bool:
+    """True if p holds no text, no content revision and nothing but (maybe) bookmarks.
+
+    Deliberately ignores the paragraph *mark's* own revision — that is a separate question,
+    answered by paragraph_mark_revision. See is_spacer_paragraph / is_rejectable_spacer_paragraph.
+    """
+    if p.tag != W + "p":
+        return False
+    if norm(visible_text(p)) != "" or norm("".join(iter_text(p, DEL_TEXT))) != "":
+        return False
+    mark_rPr = paragraph_mark_rPr(p)
+    mark_revisions = {id(child) for child in mark_rPr} if mark_rPr is not None else set()
+    for node in p.iter():
+        if node.tag in {INS, DEL} and id(node) not in mark_revisions:
+            return False
+    blocking = PROTECTED_TAGS - BOOKMARK_TAGS
+    if any(node.tag in blocking for node in p.iter()):
+        return False
+    return not has_relationship_reference(p)
+
+
+def is_spacer_paragraph(p: ET.Element) -> bool:
+    """A pure blank line with no tracked state at all.
+
+    Word Compare leaves these behind when the two documents' block structures differ — the
+    revised file's blank lines are adopted untracked, so they survive both Accept and Reject
+    and can only be removed by deleting the <w:p>.
+    """
+    return _is_contentless_paragraph(p) and paragraph_mark_revision(p) is None
+
+
+def is_rejectable_spacer_paragraph(p: ET.Element) -> bool:
+    """A blank line that is either untracked or one the revision *inserted*.
+
+    A converted revision's layout noise usually arrives as inserted blank paragraphs, so
+    Compare marks the paragraph mark itself with <w:ins>. Deleting such a paragraph is
+    exactly what Word's Reject does to it — nothing the author wrote is lost.
+
+    A *deleted* paragraph mark is left alone: that one is the reviewer's call to accept, and
+    removing it here would pre-empt them.
+    """
+    return _is_contentless_paragraph(p) and paragraph_mark_revision(p) in (None, INS)
+
+
+def relocate_bookmarks(source: ET.Element, target: ET.Element | None) -> None:
+    """Move source's bookmark anchors into target (right after its pPr) before deleting it."""
+    marks = [child for child in source if child.tag in BOOKMARK_TAGS]
+    for mark in marks:
+        source.remove(mark)
+    if target is None:
+        return
+    insert_at = 1 if len(target) and target[0].tag == W + "pPr" else 0
+    for offset, mark in enumerate(marks):
+        target.insert(insert_at + offset, mark)
+
+
+def _following_paragraph(parent: ET.Element, p: ET.Element) -> ET.Element | None:
+    siblings = list(parent)
+    for candidate in siblings[siblings.index(p) + 1:]:
+        if candidate.tag == W + "p":
+            return candidate
+    return None
+
+
+def _paragraph_is_removable(parent: ET.Element, p: ET.Element) -> bool:
+    """True if p can be deleted from parent without leaving invalid OOXML."""
+    paragraph_count = sum(1 for child in parent if child.tag == W + "p")
+    if parent.tag in {W + "tc", W + "body"} and paragraph_count <= 1:
+        return False
+    siblings = list(parent)
+    index = siblings.index(p)
+    previous = siblings[index - 1] if index > 0 else None
+    following = siblings[index + 1] if index + 1 < len(siblings) else None
+    # A paragraph between two tables keeps them apart; removing it merges them into one
+    # table with a mismatched grid.
+    if previous is not None and following is not None:
+        if previous.tag == W + "tbl" and following.tag == W + "tbl":
+            return False
+    return True
+
+
 def _page_size(sect: ET.Element) -> tuple[str | None, str | None, str | None] | None:
     """Return (w, h, orient) of a <w:sectPr>'s <w:pgSz>, or None if absent."""
     pgSz = sect.find(W + "pgSz")
@@ -975,8 +1159,13 @@ def clean_cosmetic_section_breaks(root: ET.Element) -> int:
     appear in the output as untracked, non-rejectable page breaks. We strip a mid-document
     <w:sectPr> only when its page size/orientation matches the document's final (body-level)
     section — i.e. it is a purely cosmetic page break, not a landscape/differently-sized
-    section. The body-level <w:sectPr> (whole-document page setup) is never removed, and no
-    paragraph is deleted, so bookmarks and alignment are preserved.
+    section. The body-level <w:sectPr> (whole-document page setup) is never removed.
+
+    The paragraph that *hosted* such a break is almost always an empty one the revised file
+    used as a break carrier, and leaving it behind shows up as a stray blank line above the
+    next heading. So the host paragraph is deleted too, but only when it is a pure spacer
+    (is_rejectable_spacer_paragraph) and removing it is safe (_paragraph_is_removable): its
+    bookmarks move to the following paragraph first. Anything with text or content is kept.
     """
     body = root.find(W + "body")
     if body is None:
@@ -988,18 +1177,375 @@ def clean_cosmetic_section_breaks(root: ET.Element) -> int:
     if body_pgsz is None:
         return 0
 
+    parents = build_parent_map(body)
     changed = 0
-    for p in body.iter(W + "p"):
+    for p in list(body.iter(W + "p")):
         pPr = p.find(W + "pPr")
         if pPr is None:
             continue
         sect = pPr.find(W + "sectPr")
         if sect is None:
             continue
-        if _page_size(sect) == body_pgsz:
-            pPr.remove(sect)
+        if _page_size(sect) != body_pgsz:
+            continue
+        pPr.remove(sect)
+        changed += 1
+
+        parent = parents.get(id(p))
+        if parent is None or not is_rejectable_spacer_paragraph(p):
+            continue
+        if not _paragraph_is_removable(parent, p):
+            continue
+        relocate_bookmarks(p, _following_paragraph(parent, p))
+        parent.remove(p)
+        changed += 1
+    return changed
+
+
+def clean_leading_empty_paragraphs(root: ET.Element) -> int:
+    """Drop the blank paragraphs Word Compare stacks up above the document title.
+
+    The original and the revised file each carry their own spacer above the title (in this
+    template the original keeps the logo and its 16pt gap in a single paragraph). Compare
+    adopts the revised file's spacers untracked while keeping the original's, so the title
+    drifts down the page by a blank line or two.
+
+    Every pure spacer between the last content-bearing paragraph and the first paragraph with
+    text is removed, and the gap they provided is folded back onto that content paragraph as
+    pPr/spacing/@w:after — the largest explicit `after` among the removed spacers, or
+    TITLE_GAP_AFTER. The logo paragraph itself holds a <w:drawing>, so it is not contentless
+    and bounds the scan instead of being deleted.
+    """
+    body = root.find(W + "body")
+    if body is None:
+        return 0
+
+    children = list(body)
+    first_text_index = None
+    for index, child in enumerate(children):
+        if child.tag != W + "p":
+            return 0  # a table before any text: not the letterhead pattern
+        if norm(visible_text(child)) or norm("".join(iter_text(child, DEL_TEXT))):
+            first_text_index = index
+            break
+    if first_text_index is None:
+        return 0
+
+    start = first_text_index
+    while start > 0 and is_rejectable_spacer_paragraph(children[start - 1]):
+        start -= 1
+    if start == first_text_index:
+        return 0
+
+    spacers = children[start:first_text_index]
+    following = children[first_text_index]
+    previous = children[start - 1] if start > 0 else None
+
+    gaps = []
+    for spacer in spacers:
+        pPr = spacer.find(W + "pPr")
+        spacing = pPr.find(W + "spacing") if pPr is not None else None
+        value = spacing.get(W + "after") if spacing is not None else None
+        if value and value.isdigit():
+            gaps.append(int(value))
+    gap = str(max(gaps)) if gaps else TITLE_GAP_AFTER
+
+    for spacer in spacers:
+        relocate_bookmarks(spacer, following)
+        body.remove(spacer)
+
+    if previous is not None:
+        pPr = previous.find(W + "pPr")
+        if pPr is None:
+            pPr = ET.Element(W + "pPr")
+            previous.insert(0, pPr)
+        spacing = _get_or_insert_ordered(pPr, "spacing", PPR_ORDER)
+        spacing.set(W + "after", gap)
+
+    return len(spacers)
+
+
+def _sole_text_revision(p: ET.Element) -> tuple[str, str, ET.Element] | None:
+    """Return (kind, text, elem) when p's only visible content is one text revision."""
+    payloads = text_revision_payloads(p)
+    if len(payloads) != 1:
+        return None
+    kind, text, revision = payloads[0]
+    if not norm(text):
+        return None
+    if has_visible_text_except_revision(p, revision):
+        return None
+    return kind, text, revision
+
+
+def _is_empty_table(table: ET.Element) -> bool:
+    """True if a <w:tbl> holds no text and nothing worth keeping.
+
+    Inserted paragraph marks and inserted rows are tolerated — the stray table a split
+    leaves behind is usually marked wholly inserted, and dropping it is what Reject does.
+    A *deleted* mark or row is left alone, as is any content revision.
+    """
+    if norm(visible_text(table)) != "" or norm("".join(iter_text(table, DEL_TEXT))) != "":
+        return False
+    for p in table.iter(W + "p"):
+        if not is_rejectable_spacer_paragraph(p):
+            return False
+    # Row/cell markers live outside any paragraph; an inserted row may go, a deleted one stays.
+    for local in ("trPr", "tcPr", "tblPr", "tblPrEx"):
+        for props in table.iter(W + local):
+            if props.find(DEL) is not None:
+                return False
+    for node in table.iter():
+        if node is not table and node.tag in PROTECTED_TAGS:
+            return False
+    return not has_relationship_reference(table)
+
+
+def _drop_emptied_container(p: ET.Element, parents: dict[int, ET.Element]) -> int:
+    """After a relocation, remove the paragraph left empty and its table if that empties it."""
+    parent = parents.get(id(p))
+    if parent is None or not is_rejectable_spacer_paragraph(p):
+        return 0
+    if any(node.tag in BOOKMARK_TAGS for node in p.iter()) or has_relationship_reference(p):
+        return 0
+
+    changed = 0
+    if _paragraph_is_removable(parent, p):
+        parent.remove(p)
+        changed += 1
+
+    table = parent
+    while table is not None and table.tag != W + "tbl":
+        table = parents.get(id(table))
+    if table is not None and _is_empty_table(table):
+        table_parent = parents.get(id(table))
+        if table_parent is not None:
+            table_parent.remove(table)
             changed += 1
     return changed
+
+
+def clean_relocated_table_noops(root: ET.Element) -> int:
+    """Undo a no-op that Word Compare spread across a table boundary.
+
+    When the revised file splits a table (a converted document often drops a section break
+    mid-table), Compare cannot align the two halves: it deletes a row's text from the
+    original table and re-inserts the same text — often differing only in whitespace — into
+    the new one, so the redline claims content moved when it never did.
+
+    clean_cross_paragraph_noops only compares adjacent sibling paragraphs, so it never sees
+    across the boundary. This rule matches a DEL-only paragraph against an INS-only paragraph
+    within RELOCATION_WINDOW paragraphs of flattened document order, requiring the two to sit
+    in *different* parents with at least one inside a table.
+
+    Unlike the adjacent-sibling rule it keeps the DELETION's location — the original position
+    is the true one — restoring it as unchanged text and dropping the insertion. If that
+    leaves the insertion's paragraph empty it goes too, and if the table it lived in is then
+    completely empty the whole <w:tbl> is removed.
+    """
+    body = root.find(W + "body")
+    if body is None:
+        return 0
+
+    parents = build_parent_map(body)
+    paragraphs = list(body.iter(W + "p"))
+
+    def inside_table(p: ET.Element) -> bool:
+        node = parents.get(id(p))
+        while node is not None:
+            if node.tag == W + "tbl":
+                return True
+            node = parents.get(id(node))
+        return False
+
+    changed = 0
+    for index, first in enumerate(paragraphs):
+        found = _sole_text_revision(first)
+        if found is None or found[0] != DEL:
+            continue
+        _, del_text, del_revision = found
+
+        for offset in range(1, RELOCATION_WINDOW + 1):
+            if index + offset >= len(paragraphs):
+                break
+            second = paragraphs[index + offset]
+            if parents.get(id(second)) is parents.get(id(first)):
+                continue
+            if not (inside_table(first) or inside_table(second)):
+                continue
+            match = _sole_text_revision(second)
+            if match is None or match[0] != INS:
+                continue
+            if not same_text_or_spacing_only(del_text, match[1]):
+                continue
+
+            replace_descendant(first, del_revision, del_to_unchanged_runs(del_revision))
+            replace_descendant(second, match[2], [])
+            changed += 1 + _drop_emptied_container(second, parents)
+            break
+
+    return changed
+
+
+# Punctuation that ends a sentence or a clause — a paragraph ending in one of these was not
+# split mid-sentence, so it is never a merge candidate.
+SENTENCE_BREAK_CHARS = frozenset(".?!:;,")
+
+# Content that must not be merged across paragraph boundaries. Hyperlinks and bookmarks are
+# fine (they simply move with the runs); pictures, fields, tables and comment anchors are not.
+MERGE_BLOCKING_TAGS = PROTECTED_TAGS - HYPERLINK_TAGS - BOOKMARK_TAGS
+
+# Blank paragraphs tolerated between the two halves of a split sentence. A converted
+# revision leaves one where the page furniture sat and another carrying its section break,
+# so both must be crossable; the lower-case-start test is what actually gates the merge.
+MERGE_MAX_SPACERS = 2
+
+
+def _can_continue_sentence(p: ET.Element) -> bool:
+    if is_heading_paragraph(p) or paragraph_style(p) in NON_BODY_STYLES:
+        return False
+    pPr = p.find(W + "pPr")
+    if pPr is not None:
+        if pPr.find(W + "numPr") is not None or pPr.find(W + "sectPr") is not None:
+            return False
+    # An inserted paragraph mark is the conversion's own break — merging rejects it. A
+    # deleted mark already tells the reviewer these two join, so leave that to them.
+    if paragraph_mark_revision(p) == DEL:
+        return False
+    return not any(node.tag in MERGE_BLOCKING_TAGS for node in p.iter())
+
+
+def _merge_paragraphs(first: ET.Element, second: ET.Element) -> None:
+    """Append second's content to first, inserting a separating space where needed."""
+    last_text = None
+    for node in first.iter(TEXT):
+        if node.text:
+            last_text = node
+    if last_text is not None and not last_text.text[-1:].isspace():
+        if not visible_text(second)[:1].isspace():
+            last_text.text += " "
+            last_text.set(XML_SPACE, "preserve")
+    for child in list(second):
+        if child.tag == W + "pPr":
+            continue
+        first.append(copy.deepcopy(child))
+
+
+def clean_conversion_paragraph_splits(root: ET.Element) -> int:
+    """Rejoin a sentence a converted revision split across two paragraphs.
+
+    A PDF-derived revision breaks running text wherever the page did — around a flattened
+    header/footer, for example — so one sentence arrives as two paragraphs. Word Compare
+    adopts the split untracked, leaving a paragraph that stops mid-sentence and a next one
+    that starts lower-case.
+
+    Merge only on that exact evidence: the first paragraph's visible text ends in a letter
+    (no sentence or clause terminator) and the second's starts with a lower-case letter.
+    Both must be plain body paragraphs (no heading/Title style, no list numbering, no tracked
+    paragraph mark, no section break, no pictures/fields/tables) and direct children of
+    <w:body>, which also rules out anything inside a table. Up to MERGE_MAX_SPACERS blank
+    paragraphs may sit between them; they are removed with the merge.
+    """
+    body = root.find(W + "body")
+    if body is None:
+        return 0
+
+    changed = 0
+    merged = True
+    while merged:
+        merged = False
+        children = list(body)
+        for index, first in enumerate(children):
+            if first.tag != W + "p" or not _can_continue_sentence(first):
+                continue
+            text = norm(visible_text(first))
+            if not text or not text[-1].isalpha():
+                continue
+
+            spacers: list[ET.Element] = []
+            second = None
+            for candidate in children[index + 1:]:
+                if candidate.tag != W + "p":
+                    break
+                if is_rejectable_spacer_paragraph(candidate) and not has_protected_content(candidate):
+                    if len(spacers) >= MERGE_MAX_SPACERS:
+                        break
+                    spacers.append(candidate)
+                    continue
+                second = candidate
+                break
+
+            if second is None or not _can_continue_sentence(second):
+                continue
+            next_text = norm(visible_text(second))
+            if not next_text[:1].isalpha() or not next_text[:1].islower():
+                continue
+
+            _merge_paragraphs(first, second)
+            for spacer in spacers:
+                body.remove(spacer)
+            body.remove(second)
+            changed += 1 + len(spacers)
+            merged = True
+            break
+
+    return changed
+
+
+DOCUMENT_PART = "word/document.xml"
+
+
+def clean_header_footer_relocations(
+    doc_root: ET.Element, hf_roots: dict[str, ET.Element]
+) -> dict[str, int]:
+    """Restore header/footer text that a converted revision flattened into the body.
+
+    A PDF-derived revision has no header/footer parts at all — the page furniture is baked
+    into the body text. Word Compare therefore reports the original's footer as deleted while
+    the same string shows up as an insertion in the middle of the body, which is how a footer
+    ends up printed mid-paragraph in the redline.
+
+    Match a header/footer paragraph whose only revision is a DEL against a body paragraph
+    whose only revision is an INS of the same text (whitespace-insensitive): restore the
+    header/footer del in place and delete the body insertion. Returns the change count per
+    part so the caller knows which parts to rewrite.
+    """
+    body = doc_root.find(W + "body")
+    if body is None:
+        return {}
+
+    parents = build_parent_map(body)
+    candidates = list(body.iter(W + "p"))
+    counts: dict[str, int] = {}
+
+    for name, hf_root in hf_roots.items():
+        for hf_p in list(hf_root.iter(W + "p")):
+            found = _sole_text_revision(hf_p)
+            if found is None or found[0] != DEL:
+                continue
+            _, del_text, del_revision = found
+
+            match = None
+            for body_p in candidates:
+                payload = _sole_text_revision(body_p)
+                if payload is None or payload[0] != INS:
+                    continue
+                if same_text_or_spacing_only(del_text, payload[1]):
+                    match = (body_p, payload[2])
+                    break
+            if match is None:
+                continue
+
+            body_p, ins_revision = match
+            replace_descendant(hf_p, del_revision, del_to_unchanged_runs(del_revision))
+            replace_descendant(body_p, ins_revision, [])
+            counts[name] = counts.get(name, 0) + 1
+            counts[DOCUMENT_PART] = (
+                counts.get(DOCUMENT_PART, 0) + 1 + _drop_emptied_container(body_p, parents)
+            )
+            candidates = [p for p in candidates if p is not body_p]
+
+    return counts
 
 
 def _is_image_only_revision(elem: ET.Element) -> bool:
@@ -1120,9 +1666,13 @@ def normalize_body_formatting(root: ET.Element) -> int:
     return 1 if changed else 0
 
 
-def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
-    root = ET.fromstring(xml_bytes)
-    changed_ignorable = clean_ignorable_namespaces(root)
+def clean_root(root: ET.Element) -> int:
+    """Run every artifact rule over one XML part until nothing more changes.
+
+    Order matters in one place: clean_relocated_table_noops runs before
+    clean_cosmetic_section_breaks so a stray table it empties is gone before the
+    between-two-tables guard on the break's host paragraph is evaluated.
+    """
     total_changed = 0
     while True:
         changed = (
@@ -1135,13 +1685,61 @@ def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
             + clean_trailing_heading_ins_del_noop(root)
             + clean_empty_list_paragraphs(root)
             + clean_image_revisions(root)
+            + clean_relocated_table_noops(root)
             + clean_cosmetic_section_breaks(root)
+            + clean_leading_empty_paragraphs(root)
+            + clean_conversion_paragraph_splits(root)
         )
         if changed == 0:
-            break
+            return total_changed
         total_changed += changed
-    total_changed += normalize_body_formatting(root)
-    return ET.tostring(root, encoding="utf-8", xml_declaration=True), total_changed + changed_ignorable
+
+
+def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
+    """Clean a single XML part in isolation (no cross-part rules)."""
+    root = ET.fromstring(xml_bytes)
+    changed = clean_root(root)
+    changed += normalize_body_formatting(root)
+    # Last: removing revisions orphans the prefixes they used (e.g. w16du:dateUtc), and
+    # pruning before the loop would leave them behind for a second run to notice.
+    changed += clean_ignorable_namespaces(root)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True), changed
+
+
+def clean_docx_parts(parts: dict[str, bytes]) -> dict[str, tuple[bytes, int]]:
+    """Clean every cleanable part together, so cross-part artifacts can be resolved.
+
+    Header/footer content that the revised document flattened into the body can only be
+    recognised with the body and the header/footer parts in scope at once, so all parts are
+    parsed first, cleaned individually, then reconciled and cleaned again to a fixed point.
+    """
+    roots: dict[str, ET.Element] = {}
+    counts: dict[str, int] = {}
+    for name, data in parts.items():
+        root = ET.fromstring(data)
+        roots[name] = root
+        counts[name] = clean_root(root)
+
+    doc_root = roots.get(DOCUMENT_PART)
+    if doc_root is not None:
+        hf_roots = {name: root for name, root in roots.items() if name != DOCUMENT_PART}
+        cross = clean_header_footer_relocations(doc_root, hf_roots)
+        for name, count in cross.items():
+            counts[name] = counts.get(name, 0) + count
+        if cross:
+            for name, root in roots.items():
+                counts[name] += clean_root(root)
+
+    result: dict[str, tuple[bytes, int]] = {}
+    for name, root in roots.items():
+        counts[name] += normalize_body_formatting(root)
+        # Last, once every revision that referenced a prefix is gone — see clean_document_xml.
+        counts[name] += clean_ignorable_namespaces(root)
+        result[name] = (
+            ET.tostring(root, encoding="utf-8", xml_declaration=True),
+            counts[name],
+        )
+    return result
 
 
 def clean_ignorable_namespaces(root: ET.Element) -> int:
@@ -1181,14 +1779,14 @@ CLEANABLE_PART_RE = re.compile(r"^word/(document|header\d+|footer\d+)\.xml$")
 def rewrite_docx(path: Path) -> int:
     with ZipFile(path, "r") as zin:
         infos = zin.infolist()
-        cleaned_parts: dict[str, bytes] = {}
-        changed = 0
-        for info in infos:
-            if CLEANABLE_PART_RE.match(info.filename):
-                cleaned_xml, part_changed = clean_document_xml(zin.read(info.filename))
-                if part_changed:
-                    cleaned_parts[info.filename] = cleaned_xml
-                    changed += part_changed
+        parts = {
+            info.filename: zin.read(info.filename)
+            for info in infos
+            if CLEANABLE_PART_RE.match(info.filename)
+        }
+        cleaned = clean_docx_parts(parts)
+        cleaned_parts = {name: data for name, (data, count) in cleaned.items() if count}
+        changed = sum(count for _, count in cleaned.values())
 
         if changed == 0:
             return 0
