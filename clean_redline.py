@@ -1548,30 +1548,86 @@ def clean_header_footer_relocations(
     return counts
 
 
-def _is_image_only_revision(elem: ET.Element) -> bool:
-    """True if `elem` is a <w:ins>/<w:del> that wraps an image and no visible text.
+def _has_image(elem: ET.Element) -> bool:
+    return any(node.tag in IMAGE_TAGS for node in elem.iter())
 
-    Word Compare marks the logo as an insert+delete pair of the picture when the two
-    documents reference it via different relationships. We resolve those so the logo is
-    never shown as changed, but only when the revision has no text — a revision mixing real
-    text edits with an image is left alone.
-    """
+
+def _has_ole(elem: ET.Element) -> bool:
+    """Embedded OLE objects (spreadsheets, equations) are not logos — never touch them."""
+    return any(node.tag in OLE_TAGS for node in elem.iter())
+
+
+def _is_image_only_revision(elem: ET.Element) -> bool:
+    """True if `elem` is a <w:ins>/<w:del> whose entire content is an image."""
     if elem.tag not in {INS, DEL}:
         return False
-    tags = {node.tag for node in elem.iter()}
-    if not (tags & IMAGE_TAGS):
-        return False
-    if tags & OLE_TAGS:  # preserve embedded OLE objects — they are not logos
+    if not _has_image(elem) or _has_ole(elem):
         return False
     return revision_text(elem).strip() == ""
+
+
+def _image_runs(revision: ET.Element) -> list[ET.Element]:
+    """The revision's direct <w:r> children that carry an image.
+
+    Only direct run children are handled. An image nested deeper (inside a hyperlink, say)
+    is left alone rather than half-resolved — and, importantly, reporting it as unchanged is
+    what keeps clean_root's fixed-point loop terminating.
+    """
+    return [
+        run for run in revision
+        if run.tag == W + "r" and any(node.tag in IMAGE_TAGS for node in run.iter())
+    ]
+
+
+def _resolve_image_runs(revision: ET.Element) -> list[ET.Element]:
+    """Strip the image content out of a mixed revision, returning runs to place before it.
+
+    A revision that mixes an image with real text is split rather than skipped: the image
+    is resolved (kept unmarked for an insertion, dropped for a deletion) while the text
+    stays tracked. Returns the unmarked runs the caller must insert ahead of `revision`.
+    """
+    keep_unmarked: list[ET.Element] = []
+    is_insertion = revision.tag == INS
+
+    for run in _image_runs(revision):
+        run_text = "".join(
+            node.text or "" for node in run.iter() if node.tag in {TEXT, DEL_TEXT}
+        )
+        if run_text.strip() == "":
+            # Whole run is just the image.
+            revision.remove(run)
+            if is_insertion:
+                keep_unmarked.append(copy.deepcopy(run))
+        else:
+            # Image and text share one run: lift the image out, leave the text tracked.
+            images = [node for node in run if node.tag in IMAGE_TAGS]
+            if is_insertion:
+                carrier = ET.Element(W + "r")
+                rPr = run.find(W + "rPr")
+                if rPr is not None:
+                    carrier.append(copy.deepcopy(rPr))
+                for image in images:
+                    carrier.append(copy.deepcopy(image))
+                keep_unmarked.append(carrier)
+            for image in images:
+                run.remove(image)
+
+    return keep_unmarked
 
 
 def clean_image_revisions(root: ET.Element) -> int:
     """Never show an image (the logo) as a tracked change.
 
-    Accept image-only insertions (unwrap to a normal, unchanged run) and drop image-only
-    deletions. On a delete+insert pair this keeps a single unmarked image; this is what
-    Word's "Accept All" would produce, but the image no longer renders as a change.
+    Word Compare marks a logo as an insert+delete pair of the picture whenever the two
+    documents reference it through different relationships — the image is identical, so
+    the redline is always false. Accept image insertions (unwrap to a normal, unchanged
+    run) and drop image deletions; a delete+insert pair collapses to one unmarked image.
+
+    A revision that mixes an image with real text is **split**, not skipped: the image is
+    resolved and the text stays tracked. That is what lets the logo be resolved when Word
+    sweeps a stray character into the same <w:del> as the picture. The consequence, accepted
+    deliberately: a genuine "figure and its caption deleted" edit shows the caption struck
+    through while the figure simply disappears. Embedded OLE objects are never touched.
     """
     changed = 0
 
@@ -1580,6 +1636,7 @@ def clean_image_revisions(root: ET.Element) -> int:
         i = 0
         while i < len(parent):
             child = parent[i]
+
             if _is_image_only_revision(child):
                 if child.tag == INS:
                     replacement = accepted_children(child)
@@ -1589,6 +1646,27 @@ def clean_image_revisions(root: ET.Element) -> int:
                     parent.remove(child)
                 changed += 1
                 continue
+
+            # A revision mixing an image with text: resolve only the image runs. Guarded on
+            # _image_runs being non-empty so a no-op never reports a change (which would
+            # spin clean_root's fixed-point loop forever).
+            if (
+                child.tag in {INS, DEL}
+                and not _has_ole(child)
+                and _image_runs(child)
+            ):
+                unmarked = _resolve_image_runs(child)
+                for offset, run in enumerate(unmarked):
+                    parent.insert(i + offset, run)
+                i += len(unmarked)
+                changed += 1
+                # The revision may now be empty (all its runs were images).
+                if len(parent[i]) == 0:
+                    parent.remove(parent[i])
+                    continue
+                i += 1
+                continue
+
             walk(child)
             i += 1
 

@@ -58,11 +58,35 @@ Word Compare produces misalignment artifacts when paragraph counts differ signif
 | Empty list paragraphs (`<w:numPr>` but no text/delText, no tracked change) render as orphan bullets/letters, e.g. `(a) (b) (c)…` | `clean_empty_list_paragraphs` (skips bookmark-anchoring paras and a table cell's last paragraph) |
 | Unchanged heading appears as a trailing `<w:ins>T` at the tail of a body paragraph AND as a full `<w:del>T` in a nearby heading (within 3 paras, skipping del-only paras) | `clean_trailing_heading_ins_del_noop` (drops the trailing ins run, converts the heading's del back to unchanged text) |
 | Word Compare silently injects the revised doc's section breaks (`detect format changes false` adopts them untracked, so they can't be rejected) | `clean_cosmetic_section_breaks` (removes a mid-doc `<w:sectPr>` whose `pgSz` matches the final body section; keeps landscape/differently-sized sections and the body-level section). Also deletes the break's **host paragraph** when it is a pure spacer, else a stray blank line lands above the next heading — bookmarks move forward first; skipped for a cell's last paragraph, the body's last paragraph, and a paragraph sitting between two `<w:tbl>` (removing it would splice them) |
-| Logo/picture shown as an insert+delete pair of the image (same logo, different embed relationship) | `clean_image_revisions` (accepts image-only insertions to an unmarked run, drops image-only deletions; skips revisions with text or an OLE object). `rewrite_docx` also runs the cleaner on `header*/footer*` parts since logos often live in the page header. |
+| Logo/picture shown as an insert+delete pair of the image (same logo, different embed relationship) | `clean_image_revisions` — see **Image revisions are always false** below. `rewrite_docx` also runs the cleaner on `header*/footer*` parts since logos often live in the page header. |
 | An unchanged hyperlink (e.g. a signature block e-mail) shown as ins+del differing only in whitespace, because the two files build the link differently (`HYPERLINK` field vs `<w:hyperlink>`) | `is_textlike_revision` — like `is_text_only_revision` but tolerates `HYPERLINK_TAGS`; used in `clean_parent`'s adjacent-pair branch, which resolves by *accepting* the insertion so the field is deep-copied verbatim. Drawings, OLE, tables, SDTs, bookmarks and comment anchors still block |
 | Both documents' title spacers survive, so blank lines stack up above the document title | `clean_leading_empty_paragraphs` (removes every pure spacer between the last content paragraph and the first paragraph with text, folding the gap onto that content paragraph as `spacing/@w:after` — the largest explicit `after` removed, or `TITLE_GAP_AFTER`). The logo paragraph holds a `<w:drawing>`, so it bounds the scan instead of being deleted |
 | A split table makes Compare delete a row's text from the original table and re-insert it into the new one, so content looks moved | `clean_relocated_table_noops` — matches a DEL-only against an INS-only paragraph within `RELOCATION_WINDOW` paragraphs of flattened order, in **different** parents, at least one inside a table. Unlike `clean_cross_paragraph_noops` it keeps the **deletion's** location (the original position is the true one), then drops the emptied paragraph and, if the table it lived in is now completely empty, the whole `<w:tbl>` |
 | A converted revision splits a sentence where the page broke, so one paragraph stops mid-sentence and the next starts lower-case | `clean_conversion_paragraph_splits` (merges them, inserting one space). Requires: same `<w:body>` parent (so never inside a table), first ends in a letter, second starts with a **lower-case letter**, neither is a heading/`Title`/numbered/tracked-paragraph-mark/section-break paragraph, no pictures/fields/tables, at most `MERGE_MAX_SPACERS` blanks between (removed too) |
+
+### Image revisions are always false
+
+**Product rule from the user: a redline must never show a logo/image replacement.** It is always a
+false positive — the picture is identical, Word only marks it because the two files reference it
+through different relationships.
+
+So `clean_image_revisions` resolves images unconditionally: an image insertion is accepted (unwrapped
+to a normal unmarked run), an image deletion is dropped, and a delete+insert pair collapses to one
+unmarked image.
+
+A revision that mixes an image with real text is **split, not skipped** — `_resolve_image_runs`
+resolves the image runs and leaves the text tracked. This matters because Word sometimes sweeps a
+stray character into the same `<w:del>` as the picture (a fresh Atlas comparison put a deleted `e`
+next to the old logo), and the old "skip anything with text" guard let that block the whole rule.
+An image sharing one `<w:r>` with text is lifted into its own unmarked run, carrying the `rPr` over.
+
+Deliberate consequence, accepted with the product rule: a genuine *"figure and its caption deleted"*
+edit shows the caption struck through while the figure simply disappears. Embedded OLE objects
+(`OLE_TAGS`) are never touched — they are not logos.
+
+Termination trap: the split branch is guarded on `_image_runs(child)` being non-empty. An image
+nested below a direct `<w:r>` (inside a `<w:hyperlink>`, say) is left alone and **must** report zero
+changes — reporting a change without making one spins `clean_root`'s fixed-point loop forever.
 
 ### Cross-part cleaning
 
@@ -128,5 +152,5 @@ before cleaning, so you can inspect the raw pre-clean state.
 ### Running tests
 
 ```bash
-python3 -m unittest tests/test_clean_redline.py -v   # 98 tests as of September 2026
+python3 -m unittest tests/test_clean_redline.py -v   # 103 tests as of September 2026
 ```

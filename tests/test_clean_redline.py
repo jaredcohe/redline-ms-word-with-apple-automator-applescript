@@ -738,13 +738,84 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertEqual(root.findall(f".//{W}ins"), [])
         self.assertIsNotNone(root.find(f".//{W}pict"))
 
-    def test_preserves_revision_with_image_and_text(self):
-        """A revision that mixes real inserted text with an image is left alone."""
+    def test_splits_insertion_mixing_image_and_text(self):
+        """An image is never shown as a change, so a mixed revision is split: the image is
+        resolved to an unmarked run and the inserted text stays tracked."""
         root = clean_fragment(
             "<w:p><w:ins w:id=\"1\">"
-            "<w:r><w:t>New figure: </w:t></w:r><w:r><w:drawing/></w:r>"
+            "<w:r><w:t>New figure: </w:t></w:r><w:r><w:drawing r:embed=\"rId7\"/></w:r>"
             "</w:ins></w:p>"
         )
+        ins = root.find(f".//{W}ins")
+        self.assertIsNotNone(ins)
+        self.assertEqual("".join(ins.itertext()), "New figure: ")
+        # The drawing survives, but outside the revision.
+        self.assertIsNotNone(root.find(f".//{W}drawing"))
+        self.assertIsNone(ins.find(f".//{W}drawing"))
+
+    def test_splits_deletion_mixing_image_and_text(self):
+        """The real logo case: Word sweeps a stray character into the picture's <w:del>.
+        The image goes; the deleted character stays struck through."""
+        root = clean_fragment(
+            "<w:p><w:del w:id=\"1\">"
+            "<w:r><w:delText>e</w:delText></w:r><w:r><w:drawing r:embed=\"rId8\"/></w:r>"
+            "</w:del></w:p>"
+        )
+        dele = root.find(f".//{W}del")
+        self.assertIsNotNone(dele)
+        self.assertEqual("".join(dele.itertext()), "e")
+        self.assertEqual(root.findall(f".//{W}drawing"), [])
+
+    def test_lifts_image_out_of_a_run_shared_with_text(self):
+        """Image and text in one run: the image is lifted into its own unmarked run."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\">"
+            "<w:r><w:rPr><w:b/></w:rPr><w:t>Logo</w:t><w:drawing r:embed=\"rId7\"/></w:r>"
+            "</w:ins></w:p>"
+        )
+        ins = root.find(f".//{W}ins")
+        self.assertEqual("".join(ins.itertext()), "Logo")
+        self.assertIsNone(ins.find(f".//{W}drawing"))
+        carrier = root.find(f"{W}body/{W}p/{W}r")
+        self.assertIsNotNone(carrier.find(f"{W}drawing"))
+        self.assertIsNotNone(carrier.find(f"{W}rPr/{W}b"))  # run properties carried over
+
+    def test_logo_replacement_pair_with_stray_text_collapses(self):
+        """End to end: del(stray char + old logo) + ins(new logo) leaves one plain logo."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\"><w:r><w:drawing r:embed=\"rId7\"/></w:r></w:ins></w:p>"
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:p><w:del w:id=\"2\">"
+            "<w:r><w:delText>e</w:delText></w:r><w:r><w:drawing r:embed=\"rId8\"/></w:r>"
+            "</w:del></w:p>"
+        )
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        self.assertEqual(len(root.findall(f".//{W}drawing")), 1)
+        # The stray deleted character remains visible as a deletion.
+        self.assertEqual("".join(root.find(f".//{W}del").itertext()), "e")
+
+    def test_image_revision_with_ole_object_is_untouched(self):
+        """OLE objects are not logos; a revision containing one is never split."""
+        root = clean_fragment(
+            "<w:p><w:del w:id=\"1\">"
+            "<w:r><w:delText>Schedule</w:delText></w:r>"
+            "<w:r><w:object><o:OLEObject r:id=\"rId5\"/></w:object><w:drawing/></w:r>"
+            "</w:del></w:p>"
+        )
+        self.assertIsNotNone(root.find(f".//{W}del"))
+        self.assertIsNotNone(root.find(f".//{O}OLEObject"))
+        self.assertIsNotNone(root.find(f".//{W}drawing"))
+
+    def test_image_nested_below_a_run_does_not_spin_the_loop(self):
+        """An image the splitter cannot reach must report no change, or clean_root's
+        fixed-point loop would never terminate."""
+        root = clean_fragment(
+            "<w:p><w:ins w:id=\"1\">"
+            "<w:hyperlink r:id=\"rId9\"><w:r><w:drawing r:embed=\"rId7\"/></w:r></w:hyperlink>"
+            "<w:r><w:t>caption</w:t></w:r>"
+            "</w:ins></w:p>"
+        )
+        # Reaching this assertion at all proves the loop terminated.
         self.assertIsNotNone(root.find(f".//{W}ins"))
         self.assertIsNotNone(root.find(f".//{W}drawing"))
 
