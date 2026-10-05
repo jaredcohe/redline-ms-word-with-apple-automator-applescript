@@ -1475,5 +1475,429 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertIsNotNone(ftr.find(f".//{W}del"))
 
 
+def _document(body: str) -> ET.Element:
+    """A <w:document> root for calling a single rule directly, with no other rule running."""
+    ns = (
+        f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\" "
+        f"xmlns:r=\"{clean_redline.NAMESPACES['r']}\""
+    )
+    return ET.fromstring(f"<w:document {ns}><w:body>{body}</w:body></w:document>")
+
+
+def _mark(revision: str) -> str:
+    """A paragraph mark carrying a tracked change: <w:pPr><w:rPr><w:ins|del/>."""
+    return f"<w:pPr><w:rPr><w:{revision} w:id=\"90\"/></w:rPr></w:pPr>"
+
+
+NUMBERED = "<w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>"
+PHANTOM = (
+    "<w:p>" + _mark("del") +
+    "<w:ins w:id=\"1\"><w:r><w:t>1.</w:t></w:r><w:r><w:tab/></w:r></w:ins></w:p>"
+)
+HEADING = f"<w:p>{NUMBERED}<w:r><w:t>Services</w:t></w:r></w:p>"
+
+
+class PhantomListNumberTests(unittest.TestCase):
+    """Compare flattens an auto-number into an inserted literal number in its own paragraph."""
+
+    def test_removes_phantom_number_paragraph(self):
+        root = clean_fragment(PHANTOM + HEADING)
+
+        paragraphs = root.findall(f".//{W}p")
+        self.assertEqual(len(paragraphs), 1)
+        self.assertEqual("".join(paragraphs[0].itertext()), "Services")
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        # The heading keeps its automatic numbering.
+        self.assertIsNotNone(paragraphs[0].find(f"{W}pPr/{W}numPr"))
+
+    def test_phantom_number_removal_is_idempotent(self):
+        once = clean_fragment(PHANTOM + HEADING)
+        again = clean_redline.clean_phantom_list_number_paragraphs(once)
+
+        self.assertEqual(again, 0)
+
+    def test_keeps_number_paragraph_whose_mark_is_not_deleted(self):
+        """Without the deleted mark it is a real new paragraph, not a merge carrier."""
+        body = "<w:p><w:ins w:id=\"1\"><w:r><w:t>1.</w:t></w:r></w:ins></w:p>" + HEADING
+        root = _document(body)
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+    def test_keeps_number_paragraph_when_next_is_not_numbered(self):
+        """No numPr to merge into means the number is genuinely new text."""
+        root = _document(PHANTOM + "<w:p><w:r><w:t>Services</w:t></w:r></w:p>")
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+    def test_keeps_insertion_mixing_a_number_with_words(self):
+        """A real edit that happens to start with a number must survive."""
+        body = (
+            "<w:p>" + _mark("del") +
+            "<w:ins w:id=\"1\"><w:r><w:t>1. Extra term</w:t></w:r></w:ins></w:p>"
+        ) + HEADING
+        root = _document(body)
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+    def test_keeps_number_paragraph_that_is_itself_numbered(self):
+        """Its own numPr means it renders a marker: clean_empty_list_paragraphs' business."""
+        body = (
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>"
+            "<w:rPr><w:del w:id=\"90\"/></w:rPr></w:pPr>"
+            "<w:ins w:id=\"1\"><w:r><w:t>1.</w:t></w:r></w:ins></w:p>"
+        ) + HEADING
+        root = _document(body)
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+
+class LogoSpacerMarkSwapTests(unittest.TestCase):
+    """The letterhead logo's paragraph break is swapped for the one below it."""
+
+    LOGO = "<w:p>" + _mark("ins") + "<w:r><w:drawing/></w:r></w:p>"
+
+    def test_untracks_logo_mark_and_drops_the_emptied_spacer(self):
+        root = _document(
+            self.LOGO + "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Title</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 1)
+        paragraphs = root.findall(f".//{W}p")
+        self.assertEqual(len(paragraphs), 2)
+        self.assertIsNone(clean_redline.paragraph_mark_revision(paragraphs[0]))
+        self.assertIsNotNone(paragraphs[0].find(f".//{W}drawing"))
+        self.assertEqual(root.findall(f".//{W}del"), [])
+
+    def test_logo_swap_is_idempotent(self):
+        root = _document(
+            self.LOGO + "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Title</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_logo_spacer_mark_swap(root)
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 0)
+
+    def test_keeps_swap_when_the_deleted_paragraph_has_text(self):
+        """Real deleted text below the logo is the reviewer's to accept."""
+        root = _document(
+            self.LOGO +
+            "<w:p>" + _mark("del") +
+            "<w:del w:id=\"2\"><w:r><w:delText>Old strapline</w:delText></w:r></w:del></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 0)
+
+    def test_requires_a_drawing_in_the_inserted_paragraph(self):
+        """Two blank paragraphs are clean_inserted_spacer_paragraphs' business, not this."""
+        root = _document(
+            "<w:p>" + _mark("ins") + "</w:p>" + "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Title</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 0)
+
+
+class InsertedSpacerParagraphTests(unittest.TestCase):
+    """A converted revision spaces paragraphs with blank lines the original never had."""
+
+    def test_removes_inserted_blank_paragraphs(self):
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 2)
+        paragraphs = root.findall(f".//{W}p")
+        self.assertEqual(len(paragraphs), 2)
+
+    def test_folds_the_removed_gap_onto_the_preceding_paragraph(self):
+        """Removing the blank line must not let the page tighten up."""
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:spacing w:after=\"480\"/><w:rPr><w:ins w:id=\"90\"/></w:rPr>"
+            "</w:pPr></w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_inserted_spacer_paragraphs(root)
+
+        spacing = root.findall(f".//{W}p")[0].find(f"{W}pPr/{W}spacing")
+        self.assertEqual(spacing.get(f"{W}after"), "480")
+
+    def test_keeps_a_larger_existing_gap(self):
+        root = _document(
+            "<w:p><w:pPr><w:spacing w:after=\"960\"/></w:pPr>"
+            "<w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:spacing w:after=\"240\"/><w:rPr><w:ins w:id=\"90\"/></w:rPr>"
+            "</w:pPr></w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_inserted_spacer_paragraphs(root)
+
+        spacing = root.findall(f".//{W}p")[0].find(f"{W}pPr/{W}spacing")
+        self.assertEqual(spacing.get(f"{W}after"), "960")
+
+    def test_keeps_untracked_blank_paragraphs(self):
+        """An untracked blank line is the reviewer's existing layout, not Compare's noise."""
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p/>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+
+    def test_keeps_blank_paragraphs_marked_deleted(self):
+        """A deleted mark is the reviewer's call to accept — see is_rejectable_spacer_paragraph."""
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+
+    def test_keeps_a_table_cells_only_paragraph(self):
+        """Emptying a cell of paragraphs produces OOXML Word refuses to open."""
+        root = _document(
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:tbl><w:tr><w:tc><w:tcPr/>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "</w:tc></w:tr></w:tbl>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+        self.assertEqual(len(root.findall(f".//{W}tc/{W}p")), 1)
+
+    def test_inserted_spacer_removal_is_idempotent(self):
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_inserted_spacer_paragraphs(root)
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+
+
+class EmptyHeaderFooterMarkTests(unittest.TestCase):
+    """A revised file that lost its header parts leaves tracked marks on empty paragraphs."""
+
+    @staticmethod
+    def _header(body: str) -> ET.Element:
+        ns = f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\""
+        return ET.fromstring(f"<w:hdr {ns}>{body}</w:hdr>")
+
+    def test_untracks_an_empty_header_paragraph_mark(self):
+        hdr = self._header("<w:p>" + _mark("del") + "</w:p>")
+
+        self.assertEqual(clean_redline.clean_empty_hf_paragraph_marks(hdr), 1)
+        self.assertEqual(hdr.findall(f".//{W}del"), [])
+        # The paragraph itself stays: a header part needs one.
+        self.assertEqual(len(hdr.findall(f".//{W}p")), 1)
+
+    def test_keeps_a_mark_on_a_header_paragraph_with_text(self):
+        hdr = self._header(
+            "<w:p>" + _mark("del") + "<w:r><w:t>Confidential</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_empty_hf_paragraph_marks(hdr), 0)
+
+    def test_empty_header_mark_removal_is_idempotent(self):
+        hdr = self._header("<w:p>" + _mark("ins") + "</w:p>")
+        clean_redline.clean_empty_hf_paragraph_marks(hdr)
+
+        self.assertEqual(clean_redline.clean_empty_hf_paragraph_marks(hdr), 0)
+
+
+class OrphanedMediaTests(unittest.TestCase):
+    """Resolving a logo revision orphans the deleted run's relationship and media file."""
+
+    RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+    IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+    def _parts(self, document: str, rels: str, extra=None):
+        parts = {
+            "word/document.xml": document.encode(),
+            "word/_rels/document.xml.rels": (
+                f"<Relationships xmlns=\"{self.RELS}\">{rels}</Relationships>"
+            ).encode(),
+            "word/media/image1.png": b"PNG1",
+            "word/media/image2.png": b"PNG2",
+        }
+        parts.update(extra or {})
+        return parts
+
+    def _rel(self, rid: str, target: str) -> str:
+        return f"<Relationship Id=\"{rid}\" Type=\"{self.IMAGE}\" Target=\"{target}\"/>"
+
+    DOC_USING_RID7 = (
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<w:body><w:p><w:r><w:drawing><w:blip r:embed=\"rId7\"/></w:drawing></w:r></w:p>"
+        "</w:body></w:document>"
+    )
+
+    def test_drops_the_orphaned_relationship_and_its_media(self):
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+        )
+
+        rewritten, dropped, count = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual(dropped, {"word/media/image2.png"})
+        self.assertEqual(count, 2)  # one relationship + one media file
+        self.assertIn("rId7", rewritten["word/_rels/document.xml.rels"].decode())
+        self.assertNotIn("rId8", rewritten["word/_rels/document.xml.rels"].decode())
+
+    def test_keeps_media_two_relationships_point_at(self):
+        """Only the relationship goes when something else still needs the file."""
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image1.png"),
+        )
+
+        _, dropped, _ = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual(dropped, set())
+
+    def test_relationship_ids_are_scoped_to_their_own_part(self):
+        """fontTable.xml uses rId8 for a font; that must not protect document.xml's rId8."""
+        font_table = (
+            "<w:fonts xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            "<w:font><w:embedRegular r:id=\"rId8\"/></w:font></w:fonts>"
+        )
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+            {"word/fontTable.xml": font_table.encode()},
+        )
+
+        _, dropped, _ = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual(dropped, {"word/media/image2.png"})
+
+    def test_leaves_everything_alone_when_a_part_will_not_parse(self):
+        """Fail closed: a package we cannot read fully is a package we do not touch."""
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+            {"word/settings.xml": b"<w:settings><broken>"},
+        )
+
+        rewritten, dropped, count = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual((rewritten, dropped, count), ({}, set(), 0))
+
+    def test_pruning_is_idempotent(self):
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+        )
+        rewritten, dropped, _ = clean_redline.prune_orphaned_media(parts)
+        parts.update(rewritten)
+        for name in dropped:
+            del parts[name]
+
+        self.assertEqual(clean_redline.prune_orphaned_media(parts), ({}, set(), 0))
+
+
+class OrphanedListNumberDeletionTests(unittest.TestCase):
+    """The revised file lost its numbering, so the original's literal number is struck out."""
+
+    IND = "<w:ind w:left=\"720\" w:hanging=\"360\"/>"
+    NUMBER_DEL = (
+        "<w:del w:id=\"1\"><w:r><w:delText>1.</w:delText></w:r>"
+        "<w:r><w:tab/></w:r></w:del>"
+    )
+    HEADING_RUN = "<w:r><w:t>Services</w:t></w:r>"
+
+    def _heading(self, pPr_extra: str = "", body: str = None) -> ET.Element:
+        inner = body if body is not None else (self.NUMBER_DEL + self.HEADING_RUN)
+        return _document(
+            f"<w:p><w:pPr>{self.IND}{pPr_extra}</w:pPr>{inner}</w:p>"
+        )
+
+    def test_restores_the_struck_out_section_number(self):
+        root = self._heading()
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 1)
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertEqual("".join(root.itertext()), "1.Services")
+        # The tab that puts the number in the hanging indent survives the conversion.
+        self.assertIsNotNone(root.find(f".//{W}tab"))
+
+    def test_restoring_the_number_is_idempotent(self):
+        root = self._heading()
+        clean_redline.clean_orphaned_list_number_deletions(root)
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_keeps_a_genuine_renumber(self):
+        """A real renumber swaps one number for another, so the del is paired with an ins."""
+        root = self._heading(
+            body="<w:del w:id=\"1\"><w:r><w:delText>1.</w:delText></w:r>"
+                 "<w:r><w:tab/></w:r></w:del>"
+                 "<w:ins w:id=\"2\"><w:r><w:t>2.</w:t></w:r></w:ins>"
+                 + self.HEADING_RUN
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_list_item_indentation(self):
+        """Without a hanging indent there is no reserved number slot to argue from."""
+        root = _document(
+            f"<w:p><w:pPr/>{self.NUMBER_DEL}{self.HEADING_RUN}</w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_ignores_a_deleted_figure_inside_a_money_amount(self):
+        """"$35,000" -> "$40,000" must stay tracked: no trailing period, not the first child."""
+        root = self._heading(
+            body="<w:r><w:t>$</w:t></w:r>"
+                 "<w:ins w:id=\"2\"><w:r><w:t>40</w:t></w:r></w:ins>"
+                 "<w:del w:id=\"1\"><w:r><w:delText>35</w:delText></w:r></w:del>"
+                 "<w:r><w:t>,000</w:t></w:r>"
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_a_trailing_period_on_the_number(self):
+        root = self._heading(
+            body="<w:del w:id=\"1\"><w:r><w:delText>35</w:delText></w:r>"
+                 "<w:r><w:tab/></w:r></w:del>" + self.HEADING_RUN
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_a_tab_in_the_deletion(self):
+        """Number plus tab is the list layout; a bare number deletion is something else."""
+        root = self._heading(
+            body="<w:del w:id=\"1\"><w:r><w:delText>1.</w:delText></w:r></w:del>"
+                 + self.HEADING_RUN
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_leaves_a_paragraph_that_still_has_its_own_numbering(self):
+        """With numPr intact Word supplies the number; the literal one really is redundant."""
+        root = self._heading(
+            pPr_extra="<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>"
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_a_heading_after_the_number(self):
+        """A number with nothing after it is not a heading worth keeping it for."""
+        root = self._heading(body=self.NUMBER_DEL)
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
