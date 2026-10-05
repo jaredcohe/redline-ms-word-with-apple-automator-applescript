@@ -70,6 +70,13 @@ NAMESPACES = {
 for prefix, uri in NAMESPACES.items():
     ET.register_namespace(prefix, uri)
 
+# .rels parts carry this as their default namespace; register it as the default so a
+# rewritten .rels serializes unprefixed, the way Word wrote it. No other part uses it.
+PKG_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+ET.register_namespace("", PKG_RELS_NS)
+IMAGE_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+RELS_PART_RE = re.compile(r"^word/_rels/.+\.rels$")
+
 W = f"{{{NAMESPACES['w']}}}"
 MC = f"{{{NAMESPACES['mc']}}}"
 R = f"{{{NAMESPACES['r']}}}"
@@ -1241,6 +1248,19 @@ def clean_leading_empty_paragraphs(root: ET.Element) -> int:
     following = children[first_text_index]
     previous = children[start - 1] if start > 0 else None
 
+    gap = _spacer_gap(spacers)
+
+    for spacer in spacers:
+        relocate_bookmarks(spacer, following)
+        body.remove(spacer)
+
+    _fold_gap_after(previous, gap, keep_larger=False)
+
+    return len(spacers)
+
+
+def _spacer_gap(spacers: list[ET.Element]) -> str:
+    """The vertical gap a run of removed spacer paragraphs provided, as a w:after value."""
     gaps = []
     for spacer in spacers:
         pPr = spacer.find(W + "pPr")
@@ -1248,21 +1268,270 @@ def clean_leading_empty_paragraphs(root: ET.Element) -> int:
         value = spacing.get(W + "after") if spacing is not None else None
         if value and value.isdigit():
             gaps.append(int(value))
-    gap = str(max(gaps)) if gaps else TITLE_GAP_AFTER
+    return str(max(gaps)) if gaps else TITLE_GAP_AFTER
 
-    for spacer in spacers:
-        relocate_bookmarks(spacer, following)
-        body.remove(spacer)
 
-    if previous is not None:
-        pPr = previous.find(W + "pPr")
-        if pPr is None:
-            pPr = ET.Element(W + "pPr")
-            previous.insert(0, pPr)
-        spacing = _get_or_insert_ordered(pPr, "spacing", PPR_ORDER)
-        spacing.set(W + "after", gap)
+def _fold_gap_after(previous: ET.Element | None, gap: str, *, keep_larger: bool) -> None:
+    """Fold a removed spacer's height onto `previous` as pPr/spacing/@w:after.
 
-    return len(spacers)
+    keep_larger leaves a bigger existing gap alone, which matters when spacers are removed
+    from the middle of a document whose paragraphs already carry their own spacing.
+    """
+    if previous is None or previous.tag != W + "p":
+        return
+    pPr = previous.find(W + "pPr")
+    if pPr is None:
+        pPr = ET.Element(W + "pPr")
+        previous.insert(0, pPr)
+    spacing = _get_or_insert_ordered(pPr, "spacing", PPR_ORDER)
+    if keep_larger:
+        current = spacing.get(W + "after")
+        if current and current.isdigit() and int(current) >= int(gap):
+            return
+    spacing.set(W + "after", gap)
+
+
+def _paragraph_parents(root: ET.Element) -> list[ET.Element]:
+    """Every element that directly contains at least one <w:p>, as a stable snapshot."""
+    return [node for node in root.iter() if any(child.tag == W + "p" for child in node)]
+
+
+def _is_inserted_spacer(p: ET.Element) -> bool:
+    """A blank line that exists only because the revision inserted the paragraph break."""
+    return _is_contentless_paragraph(p) and paragraph_mark_revision(p) == INS
+
+
+def clean_inserted_spacer_paragraphs(root: ET.Element) -> int:
+    """Drop the blank paragraphs a converted revision inserts throughout the document.
+
+    A file that has been through a PDF or Google-Docs round-trip separates paragraphs with
+    pPr/spacing properties where the original template uses empty paragraphs. Compare cannot
+    express that as a formatting change, so it inserts every blank paragraph the other side
+    has: in the Nooks engagement letter, 56 of 157 paragraphs, each one a change bar on a line
+    the reviewer sees as empty.
+
+    Only a paragraph whose mark is specifically <w:ins> is removed — deleting it is exactly
+    what Word's Reject does to it, so nothing authored is lost. A blank line that is untracked
+    (the reviewer's existing layout) or marked deleted (the reviewer's call to accept) is left
+    alone; this is the same principle is_rejectable_spacer_paragraph documents, with the
+    untracked half withheld because here there is no title block bounding the scan.
+
+    The gap a removed run provided is folded onto the preceding paragraph so the page does not
+    tighten up, keeping whichever of the two values is larger.
+    """
+    changed = 0
+    for parent in _paragraph_parents(root):
+        children = list(parent)
+        index = 0
+        while index < len(children):
+            if not _is_inserted_spacer(children[index]):
+                index += 1
+                continue
+            start = index
+            while index < len(children) and _is_inserted_spacer(children[index]):
+                index += 1
+            run = children[start:index]
+            previous = children[start - 1] if start > 0 else None
+            gap = _spacer_gap(run)
+            removed = 0
+            for spacer in run:
+                # Re-checked against the live parent so a run never empties a cell or body.
+                if not _paragraph_is_removable(parent, spacer):
+                    continue
+                target = _following_paragraph(parent, spacer) or previous
+                relocate_bookmarks(spacer, target)
+                parent.remove(spacer)
+                removed += 1
+            if removed:
+                _fold_gap_after(previous, gap, keep_larger=True)
+                changed += removed
+    return changed
+
+
+LIST_NUMBER_RE = re.compile(r"^\d+(\.\d+)*\.?$")
+
+
+def _is_number_only_insertion(p: ET.Element) -> bool:
+    """True when p's entire visible content is one inserted bare list number."""
+    if norm("".join(iter_text(p, DEL_TEXT))):
+        return False
+    revisions = [node for node in p if node.tag in {INS, DEL}]
+    if len(revisions) != 1 or revisions[0].tag != INS:
+        return False
+    if any(node.tag in (PROTECTED_TAGS - BOOKMARK_TAGS) for node in p.iter()):
+        return False
+    if has_relationship_reference(p):
+        return False
+    return bool(LIST_NUMBER_RE.match(norm(visible_text(p))))
+
+
+def clean_phantom_list_number_paragraphs(root: ET.Element) -> int:
+    """Remove the phantom paragraphs Compare invents for a flattened auto-number.
+
+    When one document numbers its headings with pPr/numPr and the other — typically after a
+    PDF or Google-Docs round-trip — carries the number as literal text, Word Compare has no
+    way to say "auto-number became typed text". Instead it emits, before each heading, a
+    paragraph whose only content is an inserted bare number ("3.", "10.") plus a tab, and
+    marks that paragraph's own mark deleted so it re-merges into the heading. In the Nooks
+    engagement letter this fires on all 14 sections while not a word of text has changed.
+
+    The paragraph is deleted outright even though its mark is a *deletion*, normally the
+    reviewer's call to accept (see is_rejectable_spacer_paragraph). The licence here is that
+    this paragraph exists in neither input document: Compare invented it purely as a carrier
+    for the number, exactly as the host paragraphs clean_cosmetic_section_breaks removes are
+    invented. Rejecting in Word would leave an empty paragraph above every heading.
+
+    Requiring the content to be a bare number and the *following* paragraph to carry numPr is
+    what keeps a genuine renumbering safe: a real renumber edits text inside an existing
+    paragraph and never takes this split-off shape.
+    """
+    changed = 0
+    for parent in _paragraph_parents(root):
+        for p in [child for child in parent if child.tag == W + "p"]:
+            if paragraph_mark_revision(p) != DEL:
+                continue
+            if not _is_number_only_insertion(p):
+                continue
+            pPr = p.find(W + "pPr")
+            if pPr is None or pPr.find(W + "numPr") is not None:
+                continue
+            following = _following_paragraph(parent, p)
+            if following is None:
+                continue
+            following_pPr = following.find(W + "pPr")
+            if following_pPr is None or following_pPr.find(W + "numPr") is None:
+                continue
+            if not _paragraph_is_removable(parent, p):
+                continue
+            relocate_bookmarks(p, following)
+            parent.remove(p)
+            changed += 1
+    return changed
+
+
+# A section number must end in a period to qualify for clean_orphaned_list_number_deletions.
+# Without that, a deleted figure such as "35" in "$35,000" would match.
+SECTION_NUMBER_RE = re.compile(r"^\d+(\.\d+)*\.$")
+
+
+def clean_orphaned_list_number_deletions(root: ET.Element) -> int:
+    """Keep a section number the revised document lost in a conversion.
+
+    The mirror of clean_phantom_list_number_paragraphs. Where that rule handles the revised
+    file gaining a literal number, this one handles it losing the number altogether: the
+    original's "1." has nothing to pair with, so Compare strikes it through and every heading
+    reads "1. Services" with the number crossed out. Accepting such a redline produces an
+    agreement with no section numbers at all.
+
+    What gives the accident away is that each heading keeps the hanging indent that reserved
+    space for a number — nobody renumbers a contract to nothing and leaves fourteen empty
+    number slots behind. So the deletion is turned back into unchanged text, exactly as
+    clean_trailing_heading_ins_del_noop restores a heading Compare deleted in the wrong place.
+    The number survives as literal text, which is the structure the original already used.
+
+    Deliberately narrow, because this one *overrides* a deletion rather than tidying a no-op.
+    All of these must hold:
+
+    - the <w:del> is the paragraph's first content child, and holds a <w:tab/> (list layout)
+    - its text is a bare number ending in a period (so "$35,000" -> "$40,000" cannot match)
+    - the paragraph carries pPr/ind/@w:hanging but no numPr of its own
+    - the paragraph contains no <w:ins> at all — a genuine renumber swaps one number for
+      another in place, so its deletion is always paired with an insertion
+    - unchanged text still follows the number, i.e. there is a heading to number
+    """
+    changed = 0
+    for p in root.iter(W + "p"):
+        if p.find(".//" + INS) is not None:
+            continue
+        pPr = p.find(W + "pPr")
+        if pPr is None or pPr.find(W + "numPr") is not None:
+            continue
+        ind = pPr.find(W + "ind")
+        if ind is None or ind.get(W + "hanging") is None:
+            continue
+        content = [
+            child for child in p
+            if child.tag != W + "pPr" and child.tag not in BOOKMARK_TAGS
+        ]
+        if not content or content[0].tag != DEL:
+            continue
+        del_elem = content[0]
+        if del_elem.find(".//" + W + "tab") is None:
+            continue
+        if not SECTION_NUMBER_RE.match(norm("".join(iter_text(del_elem, DEL_TEXT)))):
+            continue
+        if any(node.tag in (PROTECTED_TAGS - BOOKMARK_TAGS) for node in del_elem.iter()):
+            continue
+        if not norm("".join(iter_text(p, TEXT))):
+            continue  # nothing but the number: no heading to keep it for
+        index = list(p).index(del_elem)
+        p[index: index + 1] = del_to_unchanged_runs(del_elem)
+        changed += 1
+    return changed
+
+
+def clean_logo_spacer_mark_swap(root: ET.Element) -> int:
+    """Untrack the paragraph-break swap Compare makes around a letterhead logo.
+
+    The logo paragraph's own mark arrives as <w:ins> while the empty paragraph below it is
+    marked deleted: one break added, one removed, so the page is unchanged, yet Word draws a
+    change bar across the top of page 1. The image itself is already untracked by
+    clean_image_revisions — this is purely the paragraph break around it.
+
+    Resolved with Accept semantics, which is what the revised document actually says: the
+    logo paragraph's inserted mark becomes untracked and the empty paragraph below it goes.
+    Nothing authored is lost, because that paragraph holds no text.
+    """
+    changed = 0
+    for parent in _paragraph_parents(root):
+        children = list(parent)
+        for index in range(len(children) - 1):
+            first, second = children[index], children[index + 1]
+            if first.tag != W + "p" or second.tag != W + "p":
+                continue
+            if paragraph_mark_revision(first) != INS:
+                continue
+            if first.find(".//" + W + "drawing") is None:
+                continue
+            if norm(visible_text(first)) or norm("".join(iter_text(first, DEL_TEXT))):
+                continue
+            if not _is_contentless_paragraph(second):
+                continue
+            if paragraph_mark_revision(second) != DEL:
+                continue
+            if not _paragraph_is_removable(parent, second):
+                continue
+            mark_rPr = paragraph_mark_rPr(first)
+            mark_rPr.remove(mark_rPr.find(INS))
+            relocate_bookmarks(second, _following_paragraph(parent, second) or first)
+            parent.remove(second)
+            changed += 1
+    return changed
+
+
+def clean_empty_hf_paragraph_marks(root: ET.Element) -> int:
+    """Untrack paragraph-mark revisions on blank header/footer paragraphs.
+
+    When the two documents' header/footer structure differs — commonly because the revised
+    file lost its header parts entirely in a conversion — Compare marks the surviving empty
+    header paragraph's mark inserted or deleted. Nothing visible changes either way, but Word
+    reports the document as carrying tracked changes and draws a change bar in the header.
+
+    The paragraph itself is kept: a header part needs one. Only ever called for header*/
+    footer* parts from clean_docx_parts, because in the body a tracked mark on a blank line
+    can be a real edit.
+    """
+    changed = 0
+    for p in root.iter(W + "p"):
+        if not _is_contentless_paragraph(p):
+            continue
+        rPr = paragraph_mark_rPr(p)
+        if rPr is None:
+            continue
+        for revision in [child for child in rPr if child.tag in {INS, DEL}]:
+            rPr.remove(revision)
+            changed += 1
+    return changed
 
 
 def _sole_text_revision(p: ET.Element) -> tuple[str, str, ET.Element] | None:
@@ -1747,9 +2016,13 @@ def normalize_body_formatting(root: ET.Element) -> int:
 def clean_root(root: ET.Element) -> int:
     """Run every artifact rule over one XML part until nothing more changes.
 
-    Order matters in one place: clean_relocated_table_noops runs before
+    Order matters in three places: clean_relocated_table_noops runs before
     clean_cosmetic_section_breaks so a stray table it empties is gone before the
-    between-two-tables guard on the break's host paragraph is evaluated.
+    between-two-tables guard on the break's host paragraph is evaluated;
+    clean_logo_spacer_mark_swap runs after clean_image_revisions has untracked the logo and
+    before clean_inserted_spacer_paragraphs, which would otherwise eat the inserted half of
+    the swap; and clean_leading_empty_paragraphs claims the title block before
+    clean_inserted_spacer_paragraphs sees it, so the title keeps its TITLE_GAP_AFTER.
     """
     total_changed = 0
     while True:
@@ -1762,10 +2035,14 @@ def clean_root(root: ET.Element) -> int:
             + clean_misplaced_deletions_after_heading(root)
             + clean_trailing_heading_ins_del_noop(root)
             + clean_empty_list_paragraphs(root)
+            + clean_phantom_list_number_paragraphs(root)
+            + clean_orphaned_list_number_deletions(root)
             + clean_image_revisions(root)
             + clean_relocated_table_noops(root)
             + clean_cosmetic_section_breaks(root)
             + clean_leading_empty_paragraphs(root)
+            + clean_logo_spacer_mark_swap(root)
+            + clean_inserted_spacer_paragraphs(root)
             + clean_conversion_paragraph_splits(root)
         )
         if changed == 0:
@@ -1797,6 +2074,10 @@ def clean_docx_parts(parts: dict[str, bytes]) -> dict[str, tuple[bytes, int]]:
         root = ET.fromstring(data)
         roots[name] = root
         counts[name] = clean_root(root)
+
+    for name, root in roots.items():
+        if name != DOCUMENT_PART:
+            counts[name] += clean_empty_hf_paragraph_marks(root)
 
     doc_root = roots.get(DOCUMENT_PART)
     if doc_root is not None:
@@ -1854,17 +2135,118 @@ def clean_ignorable_namespaces(root: ET.Element) -> int:
 CLEANABLE_PART_RE = re.compile(r"^word/(document|header\d+|footer\d+)\.xml$")
 
 
+def _owning_part(rels_name: str) -> str:
+    """The part a .rels file describes: word/_rels/document.xml.rels -> word/document.xml."""
+    base, _, leaf = rels_name.rpartition("_rels/")
+    return base + leaf[: -len(".rels")]
+
+
+def _referenced_relationship_ids(parts: dict[str, bytes]) -> dict[str, set[str]]:
+    """r:id / r:embed / r:link values used by each XML part, keyed by part name.
+
+    Relationship ids are scoped to the part that declares them, so these must stay separated:
+    fontTable.xml happily uses "rId8" for an embedded font while document.xml.rels uses the
+    same id for an image. Pooling them would make every orphan look referenced.
+    """
+    used: dict[str, set[str]] = {}
+    for name, data in parts.items():
+        if not name.endswith(".xml") or RELS_PART_RE.match(name):
+            continue
+        root = ET.fromstring(data)
+        ids = {
+            value
+            for node in root.iter()
+            for attr_name, value in node.attrib.items()
+            if value and attr_name.startswith(R)
+        }
+        if ids:
+            used[name] = ids
+    return used
+
+
+def _resolve_rel_target(rels_name: str, target: str) -> str:
+    """Resolve a relationship Target against the part its .rels file belongs to."""
+    if target.startswith("/"):
+        return target.lstrip("/")
+    base = rels_name.split("_rels/")[0]
+    return os.path.normpath(base + target).replace(os.sep, "/")
+
+
+def prune_orphaned_media(parts: dict[str, bytes]) -> tuple[dict[str, bytes], set[str], int]:
+    """Drop image relationships nothing references any more, and their now-unused media.
+
+    clean_image_revisions resolves a logo's delete+insert pair by dropping the deleted run,
+    which orphans that run's relationship and the media file behind it — 31 KB of dead weight
+    in the Nooks letter. Nothing visible depends on them, but they travel with every copy of
+    the document from then on.
+
+    Returns (rewritten .rels parts, media part names to drop, number of removals). A media
+    file goes only when no surviving relationship anywhere in the package still points at it.
+    Fails closed: if any part will not parse, the package is left exactly as it was.
+    """
+    try:
+        used_by_part = _referenced_relationship_ids(parts)
+    except ET.ParseError:
+        return {}, set(), 0
+
+    rewritten: dict[str, bytes] = {}
+    orphan_targets: set[str] = set()
+    kept_targets: set[str] = set()
+    removed_rels = 0
+
+    for name, data in sorted(parts.items()):
+        if not RELS_PART_RE.match(name):
+            continue
+        try:
+            root = ET.fromstring(data)
+        except ET.ParseError:
+            return {}, set(), 0
+        used = used_by_part.get(_owning_part(name), set())
+        doomed = []
+        for rel in list(root):
+            target = rel.get("Target") or ""
+            resolved = _resolve_rel_target(name, target)
+            is_orphan_image = (
+                rel.get("Type") == IMAGE_REL_TYPE
+                and rel.get("TargetMode") != "External"
+                and (rel.get("Id") or "") not in used
+            )
+            if is_orphan_image:
+                doomed.append(rel)
+                orphan_targets.add(resolved)
+            else:
+                kept_targets.add(resolved)
+        if not doomed:
+            continue
+        for rel in doomed:
+            root.remove(rel)
+        removed_rels += len(doomed)
+        rewritten[name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    dropped = {t for t in orphan_targets if t not in kept_targets and t in parts}
+    return rewritten, dropped, removed_rels + len(dropped)
+
+
 def rewrite_docx(path: Path) -> int:
     with ZipFile(path, "r") as zin:
         infos = zin.infolist()
+        all_parts = {info.filename: zin.read(info.filename) for info in infos}
         parts = {
-            info.filename: zin.read(info.filename)
-            for info in infos
-            if CLEANABLE_PART_RE.match(info.filename)
+            name: data
+            for name, data in all_parts.items()
+            if CLEANABLE_PART_RE.match(name)
         }
         cleaned = clean_docx_parts(parts)
         cleaned_parts = {name: data for name, (data, count) in cleaned.items() if count}
         changed = sum(count for _, count in cleaned.values())
+
+        # Pruning sees the *cleaned* XML, since resolving a logo revision is what orphans a
+        # relationship in the first place. Runs before the early return so a file whose only
+        # defect is dead media still gets rewritten.
+        effective = {**all_parts, **cleaned_parts}
+        rewritten_rels, dropped, pruned = prune_orphaned_media(effective)
+        cleaned_parts.update(rewritten_rels)
+        changed += pruned
 
         if changed == 0:
             return 0
@@ -1875,6 +2257,8 @@ def rewrite_docx(path: Path) -> int:
         try:
             with ZipFile(tmp_path, "w", ZIP_DEFLATED) as zout:
                 for info in infos:
+                    if info.filename in dropped:
+                        continue
                     data = cleaned_parts.get(info.filename) or zin.read(info.filename)
                     zout.writestr(info, data)
             shutil.move(str(tmp_path), str(path))

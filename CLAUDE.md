@@ -63,6 +63,53 @@ Word Compare produces misalignment artifacts when paragraph counts differ signif
 | Both documents' title spacers survive, so blank lines stack up above the document title | `clean_leading_empty_paragraphs` (removes every pure spacer between the last content paragraph and the first paragraph with text, folding the gap onto that content paragraph as `spacing/@w:after` — the largest explicit `after` removed, or `TITLE_GAP_AFTER`). The logo paragraph holds a `<w:drawing>`, so it bounds the scan instead of being deleted |
 | A split table makes Compare delete a row's text from the original table and re-insert it into the new one, so content looks moved | `clean_relocated_table_noops` — matches a DEL-only against an INS-only paragraph within `RELOCATION_WINDOW` paragraphs of flattened order, in **different** parents, at least one inside a table. Unlike `clean_cross_paragraph_noops` it keeps the **deletion's** location (the original position is the true one), then drops the emptied paragraph and, if the table it lived in is now completely empty, the whole `<w:tbl>` |
 | A converted revision splits a sentence where the page broke, so one paragraph stops mid-sentence and the next starts lower-case | `clean_conversion_paragraph_splits` (merges them, inserting one space). Requires: same `<w:body>` parent (so never inside a table), first ends in a letter, second starts with a **lower-case letter**, neither is a heading/`Title`/numbered/tracked-paragraph-mark/section-break paragraph, no pictures/fields/tables, at most `MERGE_MAX_SPACERS` blanks between (removed too) |
+| One document auto-numbers headings with `numPr`, the other has the number as literal text, so Compare emits a phantom paragraph holding an inserted bare number (`1.`, `10.`) whose own mark is deleted so it re-merges into the heading | `clean_phantom_list_number_paragraphs` (removes the whole phantom paragraph). Requires the content to be a bare number plus tabs, the mark to be **deleted**, and the *following* paragraph to carry `numPr` — see **Removing an invented paragraph** below |
+| The revised file lost its numbering entirely, so the original's literal number has nothing to pair with and every heading reads `~~1.~~ Services` | `clean_orphaned_list_number_deletions` — turns the deletion back into unchanged text (`del_to_unchanged_runs`), keeping the number as literal text. The tell that it is accidental: each heading keeps the hanging indent that reserved space for a number. See **Overriding a deletion** below |
+| A converted revision spaces paragraphs with `pPr/spacing` where the template uses empty paragraphs, so Compare inserts every blank line the other side has (56 of 157 paragraphs in the Nooks letter) | `clean_inserted_spacer_paragraphs` — removes a contentless paragraph whose mark is specifically **`INS`**, folding the gap onto the preceding paragraph as `spacing/@w:after` (keeping whichever value is larger). Untracked and `DEL`-marked blanks are left alone |
+| The letterhead logo's paragraph mark arrives as `<w:ins>` while the empty paragraph below it is marked deleted — one break added, one removed, but a change bar across the top of page 1 | `clean_logo_spacer_mark_swap` (Accept semantics: untrack the logo's mark, drop the empty paragraph). Runs after `clean_image_revisions` has untracked the image and before `clean_inserted_spacer_paragraphs`, which would otherwise eat the inserted half |
+| A blank header/footer paragraph's mark is marked inserted or deleted because the revised file lost its header parts in a conversion | `clean_empty_hf_paragraph_marks` — strips the mark revision, **keeps** the paragraph (a header part needs one). Called from `clean_docx_parts` for `header*`/`footer*` only: in the body a tracked mark on a blank line can be a real edit |
+| A resolved logo revision leaves its relationship and media file behind, orphaned | `prune_orphaned_media` in `rewrite_docx` — drops `.../image` relationships no part still references and their media when nothing else points at them. Relationship ids are **per-part** (`fontTable.xml` uses `rId8` for a font while `document.xml.rels` uses it for an image), so the reference scan is keyed by owning part. Fails closed on any parse error |
+
+### Converted documents differ structurally, not textually
+
+A file returned via Google Docs or a PDF→Word round-trip says the same words a different way, and
+Compare can only express the difference as edits. Two signatures account for most of the noise:
+
+- **Auto-numbering flattened to literal text.** `numPr` on the heading becomes a typed `1.` + tab.
+  Compare cannot say "auto-number became text", so it invents a carrier paragraph per heading.
+- **Spacer paragraphs traded for `spacing` properties.** One side separates paragraphs with empty
+  paragraphs, the other with `pPr/spacing`, so every blank line shows as an insertion.
+
+Tells that a file has been through a converter: no embedded fonts, no `header*` parts, `ListParagraph`
+styles appearing on lists that had none, and `w:sectPr` reduced to a single default section.
+
+Worth knowing when reading such a redline: if the revised file lost its numbering entirely (no inline
+`numPr`, no style defining one), the bare numbers show as **deletions** and accepting the redline
+yields an unnumbered agreement. That is a defect in the source document, not an artifact — the cleaner
+deliberately leaves it visible.
+
+### Overriding a deletion
+
+`clean_orphaned_list_number_deletions` is the only rule that *reverses* a deletion rather than
+tidying a no-op, so it carries the most guards of anything here. It fires only when the `<w:del>` is
+the paragraph's first content child, holds a `<w:tab/>`, reads as a bare number **ending in a
+period**, sits in a paragraph with `pPr/ind/@w:hanging` but no `numPr`, with no `<w:ins>` anywhere in
+the paragraph, and with unchanged text still following.
+
+Each guard excludes a real edit. The trailing period and the first-child test keep `$35,000` →
+`$40,000` tracked (the Nooks letter contains exactly that change two paragraphs away). The
+no-insertion test is the important one: a genuine renumber swaps one number for another in place, so
+its deletion is always paired with an insertion and can never reach this rule.
+
+### Removing an invented paragraph
+
+`is_rejectable_spacer_paragraph` holds that a **deleted** paragraph mark is the reviewer's to accept,
+so a rule must not delete the paragraph out from under them. `clean_phantom_list_number_paragraphs`
+and `clean_cosmetic_section_breaks` both break that rule deliberately, and the licence is the same in
+each case: the paragraph exists in **neither input document**. Compare invented it as a carrier — for
+a literal number, or for a section break — and rejecting it in Word leaves a stray blank line where
+the carrier was. The guard that makes this safe is narrowness: the content must be *only* the thing
+Compare was carrying.
 
 ### Image revisions are always false
 
@@ -152,5 +199,5 @@ before cleaning, so you can inspect the raw pre-clean state.
 ### Running tests
 
 ```bash
-python3 -m unittest tests/test_clean_redline.py -v   # 103 tests as of September 2026
+python3 -m unittest tests/test_clean_redline.py -v   # 137 tests as of October 2026
 ```
