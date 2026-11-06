@@ -997,7 +997,12 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertEqual("".join(paras[1].itertext()), "Definitions")
 
     def test_keeps_section_break_host_with_deleted_paragraph_mark(self):
-        """A deleted mark is the reviewer's call — do not pre-empt it."""
+        """The host paragraph is spared, so the page does not move.
+
+        Its mark no longer stays tracked: clean_blank_paragraph_mark_deletions untracks a
+        deleted mark on any text-free paragraph. The paragraph itself still stands, which is
+        the protection that matters here — only the change bar on the empty line goes.
+        """
         root = clean_fragment(
             "<w:p><w:r><w:t>Body one.</w:t></w:r></w:p>"
             "<w:p><w:pPr><w:rPr><w:del w:id=\"91\" w:author=\"NU\"/></w:rPr>"
@@ -1008,7 +1013,7 @@ class CleanRedlineTests(unittest.TestCase):
         )
         body = root.find(f"{W}body")
         self.assertEqual(len(body.findall(f"{W}p")), 3)
-        self.assertIsNotNone(body.find(f".//{W}rPr/{W}del"))
+        self.assertIsNone(body.find(f".//{W}rPr/{W}del"))
         # The cosmetic sectPr still goes; only the paragraph is spared.
         self.assertIsNone(body.find(f"{W}p/{W}pPr/{W}sectPr"))
 
@@ -1164,8 +1169,8 @@ class CleanRedlineTests(unittest.TestCase):
         "<w:r><w:drawing r:embed=\"rId7\"/></w:r></w:p>"
     )
 
-    def test_removes_leading_blank_paragraphs_above_title(self):
-        """Compare keeps both documents' title spacers; fold them into the logo paragraph."""
+    def test_deduplicates_leading_blank_paragraphs_above_title(self):
+        """Compare keeps both documents' title spacers; collapse them back to one."""
         root = clean_fragment(
             self.LOGO_P
             + "<w:p><w:pPr><w:pStyle w:val=\"BodyText\"/>"
@@ -1174,39 +1179,44 @@ class CleanRedlineTests(unittest.TestCase):
             "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr>"
             "<w:r><w:t>Retained Search Services Agreement</w:t></w:r></w:p>"
         )
-        body = root.find(f"{W}body")
-        paras = body.findall(f"{W}p")
-        self.assertEqual(len(paras), 2)
+        paras = root.find(f"{W}body").findall(f"{W}p")
+        self.assertEqual(len(paras), 3)
         self.assertIsNotNone(paras[0].find(f".//{W}drawing"))
-        self.assertEqual("".join(paras[1].itertext()), "Retained Search Services Agreement")
-        # The largest `after` among the removed spacers moves onto the logo paragraph.
-        self.assertEqual(paras[0].find(f"{W}pPr/{W}spacing").get(f"{W}after"), "320")
+        self.assertEqual("".join(paras[2].itertext()), "Retained Search Services Agreement")
+        # The survivor is the spacer against the title, carrying the intended gap.
+        self.assertEqual(paras[1].find(f"{W}pPr/{W}spacing").get(f"{W}after"), "320")
+        # No gap is folded onto the logo any more. It still gets a `spacing` element from
+        # normalize_body_formatting for line height, but carries no `after`.
+        self.assertIsNone(paras[0].find(f"{W}pPr/{W}spacing").get(f"{W}after"))
 
-    def test_leading_blank_removal_defaults_the_title_gap(self):
-        """Spacers with no explicit `after` still leave TITLE_GAP_AFTER of space."""
+    def test_keeps_a_single_leading_blank_paragraph(self):
+        """One spacer is the document's own gap, not a duplicate — removing it moves the page.
+
+        Applied Systems' letterhead has exactly this shape, and folding the old hardcoded
+        TITLE_GAP_AFTER in its place pulled the title up by about 0.14 inch.
+        """
         root = clean_fragment(
             self.LOGO_P
-            + "<w:p/>"
+            + "<w:p><w:pPr><w:pStyle w:val=\"BodyText\"/>"
+            "<w:spacing w:before=\"245\"/></w:pPr></w:p>"
             "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr>"
             "<w:r><w:t>Agreement</w:t></w:r></w:p>"
         )
         paras = root.find(f"{W}body").findall(f"{W}p")
-        self.assertEqual(len(paras), 2)
-        self.assertEqual(
-            paras[0].find(f"{W}pPr/{W}spacing").get(f"{W}after"),
-            clean_redline.TITLE_GAP_AFTER,
-        )
+        self.assertEqual(len(paras), 3)
+        self.assertEqual(paras[1].find(f"{W}pPr/{W}spacing").get(f"{W}before"), "245")
 
     def test_leading_blank_removal_relocates_bookmarks(self):
-        """A leading spacer's bookmark moves to the first text paragraph."""
+        """A removed spacer's bookmark moves to the surviving spacer."""
         root = clean_fragment(
             self.LOGO_P
             + "<w:p><w:bookmarkStart w:id=\"3\" w:name=\"_Title\"/>"
             "<w:bookmarkEnd w:id=\"3\"/></w:p>"
+            "<w:p/>"
             "<w:p><w:r><w:t>Agreement</w:t></w:r></w:p>"
         )
         paras = root.find(f"{W}body").findall(f"{W}p")
-        self.assertEqual(len(paras), 2)
+        self.assertEqual(len(paras), 3)
         self.assertEqual(paras[1].find(f"{W}bookmarkStart").get(f"{W}name"), "_Title")
 
     def test_preserves_leading_paragraph_holding_the_logo(self):
@@ -1473,6 +1483,794 @@ class CleanRedlineTests(unittest.TestCase):
         self.assertEqual(counts, {})
         self.assertIsNotNone(doc.find(f".//{W}ins"))
         self.assertIsNotNone(ftr.find(f".//{W}del"))
+
+
+def _document(body: str) -> ET.Element:
+    """A <w:document> root for calling a single rule directly, with no other rule running."""
+    ns = (
+        f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\" "
+        f"xmlns:r=\"{clean_redline.NAMESPACES['r']}\""
+    )
+    return ET.fromstring(f"<w:document {ns}><w:body>{body}</w:body></w:document>")
+
+
+def _mark(revision: str) -> str:
+    """A paragraph mark carrying a tracked change: <w:pPr><w:rPr><w:ins|del/>."""
+    return f"<w:pPr><w:rPr><w:{revision} w:id=\"90\"/></w:rPr></w:pPr>"
+
+
+NUMBERED = "<w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr></w:pPr>"
+PHANTOM = (
+    "<w:p>" + _mark("del") +
+    "<w:ins w:id=\"1\"><w:r><w:t>1.</w:t></w:r><w:r><w:tab/></w:r></w:ins></w:p>"
+)
+HEADING = f"<w:p>{NUMBERED}<w:r><w:t>Services</w:t></w:r></w:p>"
+
+
+class PhantomListNumberTests(unittest.TestCase):
+    """Compare flattens an auto-number into an inserted literal number in its own paragraph."""
+
+    def test_removes_phantom_number_paragraph(self):
+        root = clean_fragment(PHANTOM + HEADING)
+
+        paragraphs = root.findall(f".//{W}p")
+        self.assertEqual(len(paragraphs), 1)
+        self.assertEqual("".join(paragraphs[0].itertext()), "Services")
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        # The heading keeps its automatic numbering.
+        self.assertIsNotNone(paragraphs[0].find(f"{W}pPr/{W}numPr"))
+
+    def test_phantom_number_removal_is_idempotent(self):
+        once = clean_fragment(PHANTOM + HEADING)
+        again = clean_redline.clean_phantom_list_number_paragraphs(once)
+
+        self.assertEqual(again, 0)
+
+    def test_keeps_number_paragraph_whose_mark_is_not_deleted(self):
+        """Without the deleted mark it is a real new paragraph, not a merge carrier."""
+        body = "<w:p><w:ins w:id=\"1\"><w:r><w:t>1.</w:t></w:r></w:ins></w:p>" + HEADING
+        root = _document(body)
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+    def test_keeps_number_paragraph_when_next_is_not_numbered(self):
+        """No numPr to merge into means the number is genuinely new text."""
+        root = _document(PHANTOM + "<w:p><w:r><w:t>Services</w:t></w:r></w:p>")
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+    def test_keeps_insertion_mixing_a_number_with_words(self):
+        """A real edit that happens to start with a number must survive."""
+        body = (
+            "<w:p>" + _mark("del") +
+            "<w:ins w:id=\"1\"><w:r><w:t>1. Extra term</w:t></w:r></w:ins></w:p>"
+        ) + HEADING
+        root = _document(body)
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+    def test_keeps_number_paragraph_that_is_itself_numbered(self):
+        """Its own numPr means it renders a marker: clean_empty_list_paragraphs' business."""
+        body = (
+            "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>"
+            "<w:rPr><w:del w:id=\"90\"/></w:rPr></w:pPr>"
+            "<w:ins w:id=\"1\"><w:r><w:t>1.</w:t></w:r></w:ins></w:p>"
+        ) + HEADING
+        root = _document(body)
+
+        self.assertEqual(clean_redline.clean_phantom_list_number_paragraphs(root), 0)
+
+
+class LogoSpacerMarkSwapTests(unittest.TestCase):
+    """The letterhead logo's paragraph break is swapped for the one below it."""
+
+    LOGO = "<w:p>" + _mark("ins") + "<w:r><w:drawing/></w:r></w:p>"
+
+    def test_untracks_logo_mark_and_drops_the_emptied_spacer(self):
+        root = _document(
+            self.LOGO + "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Title</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 1)
+        paragraphs = root.findall(f".//{W}p")
+        self.assertEqual(len(paragraphs), 2)
+        self.assertIsNone(clean_redline.paragraph_mark_revision(paragraphs[0]))
+        self.assertIsNotNone(paragraphs[0].find(f".//{W}drawing"))
+        self.assertEqual(root.findall(f".//{W}del"), [])
+
+    def test_logo_swap_is_idempotent(self):
+        root = _document(
+            self.LOGO + "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Title</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_logo_spacer_mark_swap(root)
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 0)
+
+    def test_keeps_swap_when_the_deleted_paragraph_has_text(self):
+        """Real deleted text below the logo is the reviewer's to accept."""
+        root = _document(
+            self.LOGO +
+            "<w:p>" + _mark("del") +
+            "<w:del w:id=\"2\"><w:r><w:delText>Old strapline</w:delText></w:r></w:del></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 0)
+
+    def test_requires_a_drawing_in_the_inserted_paragraph(self):
+        """Two blank paragraphs are clean_inserted_spacer_paragraphs' business, not this."""
+        root = _document(
+            "<w:p>" + _mark("ins") + "</w:p>" + "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Title</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_logo_spacer_mark_swap(root), 0)
+
+
+class InsertedSpacerParagraphTests(unittest.TestCase):
+    """A converted revision spaces paragraphs with blank lines the original never had."""
+
+    def test_removes_inserted_blank_paragraphs(self):
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 2)
+        paragraphs = root.findall(f".//{W}p")
+        self.assertEqual(len(paragraphs), 2)
+
+    def test_folds_the_removed_gap_onto_the_preceding_paragraph(self):
+        """Removing the blank line must not let the page tighten up."""
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:spacing w:after=\"480\"/><w:rPr><w:ins w:id=\"90\"/></w:rPr>"
+            "</w:pPr></w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_inserted_spacer_paragraphs(root)
+
+        spacing = root.findall(f".//{W}p")[0].find(f"{W}pPr/{W}spacing")
+        self.assertEqual(spacing.get(f"{W}after"), "480")
+
+    def test_keeps_a_larger_existing_gap(self):
+        root = _document(
+            "<w:p><w:pPr><w:spacing w:after=\"960\"/></w:pPr>"
+            "<w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p><w:pPr><w:spacing w:after=\"240\"/><w:rPr><w:ins w:id=\"90\"/></w:rPr>"
+            "</w:pPr></w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_inserted_spacer_paragraphs(root)
+
+        spacing = root.findall(f".//{W}p")[0].find(f"{W}pPr/{W}spacing")
+        self.assertEqual(spacing.get(f"{W}after"), "960")
+
+    def test_keeps_untracked_blank_paragraphs(self):
+        """An untracked blank line is the reviewer's existing layout, not Compare's noise."""
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p/>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+
+    def test_keeps_blank_paragraphs_marked_deleted(self):
+        """A deleted mark is the reviewer's call to accept — see is_rejectable_spacer_paragraph."""
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+
+    def test_keeps_a_table_cells_only_paragraph(self):
+        """Emptying a cell of paragraphs produces OOXML Word refuses to open."""
+        root = _document(
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:tbl><w:tr><w:tc><w:tcPr/>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "</w:tc></w:tr></w:tbl>"
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+        self.assertEqual(len(root.findall(f".//{W}tc/{W}p")), 1)
+
+    def test_inserted_spacer_removal_is_idempotent(self):
+        root = _document(
+            "<w:p><w:r><w:t>First.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("ins") + "</w:p>"
+            "<w:p><w:r><w:t>Second.</w:t></w:r></w:p>"
+        )
+        clean_redline.clean_inserted_spacer_paragraphs(root)
+
+        self.assertEqual(clean_redline.clean_inserted_spacer_paragraphs(root), 0)
+
+
+class EmptyHeaderFooterMarkTests(unittest.TestCase):
+    """A revised file that lost its header parts leaves tracked marks on empty paragraphs."""
+
+    @staticmethod
+    def _header(body: str) -> ET.Element:
+        ns = f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\""
+        return ET.fromstring(f"<w:hdr {ns}>{body}</w:hdr>")
+
+    def test_untracks_an_empty_header_paragraph_mark(self):
+        hdr = self._header("<w:p>" + _mark("del") + "</w:p>")
+
+        self.assertEqual(clean_redline.clean_empty_hf_paragraph_marks(hdr), 1)
+        self.assertEqual(hdr.findall(f".//{W}del"), [])
+        # The paragraph itself stays: a header part needs one.
+        self.assertEqual(len(hdr.findall(f".//{W}p")), 1)
+
+    def test_keeps_a_mark_on_a_header_paragraph_with_text(self):
+        hdr = self._header(
+            "<w:p>" + _mark("del") + "<w:r><w:t>Confidential</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_empty_hf_paragraph_marks(hdr), 0)
+
+    def test_empty_header_mark_removal_is_idempotent(self):
+        hdr = self._header("<w:p>" + _mark("ins") + "</w:p>")
+        clean_redline.clean_empty_hf_paragraph_marks(hdr)
+
+        self.assertEqual(clean_redline.clean_empty_hf_paragraph_marks(hdr), 0)
+
+
+class OrphanedMediaTests(unittest.TestCase):
+    """Resolving a logo revision orphans the deleted run's relationship and media file."""
+
+    RELS = "http://schemas.openxmlformats.org/package/2006/relationships"
+    IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+    def _parts(self, document: str, rels: str, extra=None):
+        parts = {
+            "word/document.xml": document.encode(),
+            "word/_rels/document.xml.rels": (
+                f"<Relationships xmlns=\"{self.RELS}\">{rels}</Relationships>"
+            ).encode(),
+            "word/media/image1.png": b"PNG1",
+            "word/media/image2.png": b"PNG2",
+        }
+        parts.update(extra or {})
+        return parts
+
+    def _rel(self, rid: str, target: str) -> str:
+        return f"<Relationship Id=\"{rid}\" Type=\"{self.IMAGE}\" Target=\"{target}\"/>"
+
+    DOC_USING_RID7 = (
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+        "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+        "<w:body><w:p><w:r><w:drawing><w:blip r:embed=\"rId7\"/></w:drawing></w:r></w:p>"
+        "</w:body></w:document>"
+    )
+
+    def test_drops_the_orphaned_relationship_and_its_media(self):
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+        )
+
+        rewritten, dropped, count = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual(dropped, {"word/media/image2.png"})
+        self.assertEqual(count, 2)  # one relationship + one media file
+        self.assertIn("rId7", rewritten["word/_rels/document.xml.rels"].decode())
+        self.assertNotIn("rId8", rewritten["word/_rels/document.xml.rels"].decode())
+
+    def test_keeps_media_two_relationships_point_at(self):
+        """Only the relationship goes when something else still needs the file."""
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image1.png"),
+        )
+
+        _, dropped, _ = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual(dropped, set())
+
+    def test_relationship_ids_are_scoped_to_their_own_part(self):
+        """fontTable.xml uses rId8 for a font; that must not protect document.xml's rId8."""
+        font_table = (
+            "<w:fonts xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" "
+            "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">"
+            "<w:font><w:embedRegular r:id=\"rId8\"/></w:font></w:fonts>"
+        )
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+            {"word/fontTable.xml": font_table.encode()},
+        )
+
+        _, dropped, _ = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual(dropped, {"word/media/image2.png"})
+
+    def test_leaves_everything_alone_when_a_part_will_not_parse(self):
+        """Fail closed: a package we cannot read fully is a package we do not touch."""
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+            {"word/settings.xml": b"<w:settings><broken>"},
+        )
+
+        rewritten, dropped, count = clean_redline.prune_orphaned_media(parts)
+
+        self.assertEqual((rewritten, dropped, count), ({}, set(), 0))
+
+    def test_pruning_is_idempotent(self):
+        parts = self._parts(
+            self.DOC_USING_RID7,
+            self._rel("rId7", "media/image1.png") + self._rel("rId8", "media/image2.png"),
+        )
+        rewritten, dropped, _ = clean_redline.prune_orphaned_media(parts)
+        parts.update(rewritten)
+        for name in dropped:
+            del parts[name]
+
+        self.assertEqual(clean_redline.prune_orphaned_media(parts), ({}, set(), 0))
+
+
+class OrphanedListNumberDeletionTests(unittest.TestCase):
+    """The revised file lost its numbering, so the original's literal number is struck out."""
+
+    IND = "<w:ind w:left=\"720\" w:hanging=\"360\"/>"
+    NUMBER_DEL = (
+        "<w:del w:id=\"1\"><w:r><w:delText>1.</w:delText></w:r>"
+        "<w:r><w:tab/></w:r></w:del>"
+    )
+    HEADING_RUN = "<w:r><w:t>Services</w:t></w:r>"
+
+    def _heading(self, pPr_extra: str = "", body: str = None) -> ET.Element:
+        inner = body if body is not None else (self.NUMBER_DEL + self.HEADING_RUN)
+        return _document(
+            f"<w:p><w:pPr>{self.IND}{pPr_extra}</w:pPr>{inner}</w:p>"
+        )
+
+    def test_restores_the_struck_out_section_number(self):
+        root = self._heading()
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 1)
+        self.assertEqual(root.findall(f".//{W}del"), [])
+        self.assertEqual("".join(root.itertext()), "1.Services")
+        # The tab that puts the number in the hanging indent survives the conversion.
+        self.assertIsNotNone(root.find(f".//{W}tab"))
+
+    def test_restoring_the_number_is_idempotent(self):
+        root = self._heading()
+        clean_redline.clean_orphaned_list_number_deletions(root)
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_keeps_a_genuine_renumber(self):
+        """A real renumber swaps one number for another, so the del is paired with an ins."""
+        root = self._heading(
+            body="<w:del w:id=\"1\"><w:r><w:delText>1.</w:delText></w:r>"
+                 "<w:r><w:tab/></w:r></w:del>"
+                 "<w:ins w:id=\"2\"><w:r><w:t>2.</w:t></w:r></w:ins>"
+                 + self.HEADING_RUN
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_list_item_indentation(self):
+        """Without a hanging indent there is no reserved number slot to argue from."""
+        root = _document(
+            f"<w:p><w:pPr/>{self.NUMBER_DEL}{self.HEADING_RUN}</w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_ignores_a_deleted_figure_inside_a_money_amount(self):
+        """"$35,000" -> "$40,000" must stay tracked: no trailing period, not the first child."""
+        root = self._heading(
+            body="<w:r><w:t>$</w:t></w:r>"
+                 "<w:ins w:id=\"2\"><w:r><w:t>40</w:t></w:r></w:ins>"
+                 "<w:del w:id=\"1\"><w:r><w:delText>35</w:delText></w:r></w:del>"
+                 "<w:r><w:t>,000</w:t></w:r>"
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_a_trailing_period_on_the_number(self):
+        root = self._heading(
+            body="<w:del w:id=\"1\"><w:r><w:delText>35</w:delText></w:r>"
+                 "<w:r><w:tab/></w:r></w:del>" + self.HEADING_RUN
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_a_tab_in_the_deletion(self):
+        """Number plus tab is the list layout; a bare number deletion is something else."""
+        root = self._heading(
+            body="<w:del w:id=\"1\"><w:r><w:delText>1.</w:delText></w:r></w:del>"
+                 + self.HEADING_RUN
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_leaves_a_paragraph_that_still_has_its_own_numbering(self):
+        """With numPr intact Word supplies the number; the literal one really is redundant."""
+        root = self._heading(
+            pPr_extra="<w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>"
+        )
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+    def test_requires_a_heading_after_the_number(self):
+        """A number with nothing after it is not a heading worth keeping it for."""
+        root = self._heading(body=self.NUMBER_DEL)
+
+        self.assertEqual(clean_redline.clean_orphaned_list_number_deletions(root), 0)
+
+
+class BlankParagraphMarkDeletionTests(unittest.TestCase):
+    """The original held the surplus spacers, so they arrive as deleted paragraph marks."""
+
+    LOGO = "<w:p>" + _mark("del") + "<w:r><w:drawing/></w:r></w:p>"
+
+    def test_untracks_a_deleted_mark_on_a_blank_paragraph(self):
+        root = _document(
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>Heading follows.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 1)
+        paras = root.findall(f".//{W}p")
+        # The blank line stays exactly where it was; only the change bar goes.
+        self.assertEqual(len(paras), 3)
+        self.assertIsNone(clean_redline.paragraph_mark_revision(paras[1]))
+
+    def test_untracks_the_logo_paragraphs_deleted_mark(self):
+        """The logo has no text, so a drawing must not disqualify it."""
+        root = _document(self.LOGO + "<w:p><w:r><w:t>Title</w:t></w:r></w:p>")
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 1)
+        paras = root.findall(f".//{W}p")
+        self.assertIsNotNone(paras[0].find(f".//{W}drawing"))
+        self.assertIsNone(clean_redline.paragraph_mark_revision(paras[0]))
+
+    def test_keeps_a_deleted_mark_on_a_paragraph_with_text(self):
+        """There it means the paragraph break was deleted — a real structural edit."""
+        root = _document(
+            "<w:p>" + _mark("del") + "<w:r><w:t>Sentence continues</w:t></w:r></w:p>"
+            "<w:p><w:r><w:t>onto the next line.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 0)
+
+    def test_keeps_a_blank_inside_a_merge_chain(self):
+        """Consecutive deleted marks rejoin a sentence a conversion split; do not break them.
+
+        Applied Systems' letter splits a sentence around an inline footer, and the run of
+        deleted marks is what puts it back together on Accept.
+        """
+        root = _document(
+            "<w:p>" + _mark("del") + "<w:r><w:t>do not apply to</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p>" + _mark("del") + "</w:p>"
+            "<w:p><w:r><w:t>any other role.</w:t></w:r></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 0)
+
+    def test_keeps_a_blank_holding_a_comment_anchor(self):
+        """A comment anchor is content the mark could be standing in for."""
+        root = _document(
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") + "<w:commentReference w:id=\"1\"/></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 0)
+
+    def test_keeps_a_blank_with_a_content_revision(self):
+        """A deleted image is content, even though it contributes no text."""
+        root = _document(
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") +
+            "<w:del w:id=\"7\"><w:r><w:drawing/></w:r></w:del></w:p>"
+        )
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 0)
+
+    def test_blank_mark_untracking_is_idempotent(self):
+        root = _document(
+            "<w:p><w:r><w:t>Body.</w:t></w:r></w:p>"
+            "<w:p>" + _mark("del") + "</w:p>"
+        )
+        clean_redline.clean_blank_paragraph_mark_deletions(root)
+
+        self.assertEqual(clean_redline.clean_blank_paragraph_mark_deletions(root), 0)
+
+
+class SectionMarginTests(unittest.TestCase):
+    """A converter set the bottom margin inside the footer distance, so text runs under it."""
+
+    @staticmethod
+    def _doc(top, bottom, footer):
+        ns = f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\""
+        return ET.fromstring(
+            f"<w:document {ns}><w:body><w:sectPr>"
+            f"<w:pgSz w:w=\"12240\" w:h=\"15840\"/>"
+            f"<w:pgMar w:top=\"{top}\" w:bottom=\"{bottom}\" w:left=\"1080\""
+            f" w:right=\"1080\" w:header=\"720\" w:footer=\"{footer}\"/>"
+            f"</w:sectPr></w:body></w:document>"
+        )
+
+    def _bottom(self, root):
+        return root.find(f".//{W}pgMar").get(f"{W}bottom")
+
+    def test_raises_a_bottom_margin_inside_the_footer_distance(self):
+        root = self._doc(top="1080", bottom="280", footer="720")
+
+        self.assertEqual(clean_redline.normalize_section_margins(root), 1)
+        self.assertEqual(self._bottom(root), "1080")
+
+    def test_leaves_a_smaller_bottom_margin_that_clears_the_footer(self):
+        """Asymmetric on purpose is fine — only a margin inside the footer is never intended."""
+        root = self._doc(top="1440", bottom="1080", footer="720")
+
+        self.assertEqual(clean_redline.normalize_section_margins(root), 0)
+        self.assertEqual(self._bottom(root), "1080")
+
+    def test_leaves_a_symmetric_page_setup_alone(self):
+        root = self._doc(top="1152", bottom="1152", footer="720")
+
+        self.assertEqual(clean_redline.normalize_section_margins(root), 0)
+
+    def test_margin_repair_is_idempotent(self):
+        root = self._doc(top="1080", bottom="280", footer="720")
+        clean_redline.normalize_section_margins(root)
+
+        self.assertEqual(clean_redline.normalize_section_margins(root), 0)
+
+
+class FooterRelocationMirrorTests(unittest.TestCase):
+    """The *original* had the page furniture inline, so the footer copy arrives inserted."""
+
+    @staticmethod
+    def _doc_and_footer(body, footer):
+        ns = (
+            f"xmlns:w=\"{clean_redline.NAMESPACES['w']}\" "
+            f"xmlns:r=\"{clean_redline.NAMESPACES['r']}\""
+        )
+        return (
+            ET.fromstring(f"<w:document {ns}><w:body>{body}</w:body></w:document>"),
+            ET.fromstring(f"<w:ftr {ns}>{footer}</w:ftr>"),
+        )
+
+    def test_accepts_a_footer_insertion_matching_a_body_deletion(self):
+        doc, ftr = self._doc_and_footer(
+            "<w:p><w:r><w:t>Body text.</w:t></w:r></w:p>"
+            "<w:p><w:del w:id=\"1\"><w:r><w:delText>ID:0</w:delText></w:r></w:del></w:p>"
+            "<w:p><w:r><w:t>More body text.</w:t></w:r></w:p>",
+            "<w:p><w:ins w:id=\"2\"><w:r><w:t>ID:0</w:t></w:r></w:ins></w:p>",
+        )
+        counts = clean_redline.clean_header_footer_relocations(
+            doc, {"word/footer3.xml": ftr}
+        )
+
+        self.assertEqual(counts["word/footer3.xml"], 1)
+        # The text stays in the footer, now untracked.
+        self.assertEqual(ftr.findall(f".//{W}ins"), [])
+        self.assertEqual("".join(ftr.itertext()), "ID:0")
+        # And its inline copy is gone from the body.
+        self.assertEqual(doc.findall(f".//{W}del"), [])
+        self.assertNotIn("ID:0", "".join(doc.itertext()))
+
+    def test_leaves_a_footer_insertion_with_no_matching_body_deletion(self):
+        """Text the author really did add to the footer stays tracked."""
+        doc, ftr = self._doc_and_footer(
+            "<w:p><w:r><w:t>Body text.</w:t></w:r></w:p>",
+            "<w:p><w:ins w:id=\"2\"><w:r><w:t>ID:0</w:t></w:r></w:ins></w:p>",
+        )
+        counts = clean_redline.clean_header_footer_relocations(
+            doc, {"word/footer3.xml": ftr}
+        )
+
+        self.assertEqual(counts, {})
+        self.assertIsNotNone(ftr.find(f".//{W}ins"))
+
+    def test_footer_mirror_requires_matching_text(self):
+        doc, ftr = self._doc_and_footer(
+            "<w:p><w:del w:id=\"1\"><w:r><w:delText>ID:9999</w:delText></w:r></w:del></w:p>",
+            "<w:p><w:ins w:id=\"2\"><w:r><w:t>ID:0</w:t></w:r></w:ins></w:p>",
+        )
+        counts = clean_redline.clean_header_footer_relocations(
+            doc, {"word/footer3.xml": ftr}
+        )
+
+        self.assertEqual(counts, {})
+        self.assertIsNotNone(doc.find(f".//{W}del"))
+        self.assertIsNotNone(ftr.find(f".//{W}ins"))
+
+
+class DefaultFontTests(unittest.TestCase):
+    """Compare adopts the revised document's stylesheet, so its default font comes with it."""
+
+    @staticmethod
+    def _styles(rpr_default, extra_styles="", root_attrs=""):
+        return (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            f'<w:styles xmlns:w="{clean_redline.NAMESPACES["w"]}"'
+            f' xmlns:mc="{clean_redline.NAMESPACES["mc"]}"{root_attrs}>'
+            f"<w:docDefaults><w:rPrDefault>{rpr_default}</w:rPrDefault>"
+            "<w:pPrDefault><w:pPr/></w:pPrDefault></w:docDefaults>"
+            f"{extra_styles}</w:styles>"
+        ).encode("utf-8")
+
+    FONTS = (
+        '<w:rPr><w:rFonts w:ascii="{0}" w:eastAsia="Arial Unicode MS"'
+        ' w:hAnsi="{0}" w:cs="{0}"/></w:rPr>'
+    )
+
+    def test_repoints_the_default_font_at_the_house_font(self):
+        before = self._styles(self.FONTS.format("Times New Roman"))
+
+        after, changed = clean_redline.normalize_default_font(before)
+
+        self.assertEqual(changed, 1)
+        text = after.decode()
+        self.assertIn('w:ascii="Arial"', text)
+        self.assertIn('w:hAnsi="Arial"', text)
+        self.assertIn('w:cs="Arial"', text)
+        self.assertNotIn("Times New Roman", text)
+
+    def test_leaves_the_east_asian_font_alone(self):
+        """eastAsia only affects CJK text these contracts never contain."""
+        after, _ = clean_redline.normalize_default_font(
+            self._styles(self.FONTS.format("Times New Roman"))
+        )
+
+        self.assertIn('w:eastAsia="Arial Unicode MS"', after.decode())
+
+    def test_leaves_a_stylesheet_already_on_the_house_font(self):
+        before = self._styles(self.FONTS.format("Arial"))
+
+        after, changed = clean_redline.normalize_default_font(before)
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(after, before)
+
+    def test_does_not_create_an_absent_font_attribute(self):
+        """No ascii attribute means the theme supplies the font — leave it be."""
+        before = self._styles('<w:rPr><w:rFonts w:eastAsia="Arial Unicode MS"/></w:rPr>')
+
+        after, changed = clean_redline.normalize_default_font(before)
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(after, before)
+
+    def test_ignores_a_font_declared_only_by_a_named_style(self):
+        """A style naming its own font still wins; only the default is this rule's business."""
+        before = self._styles(
+            "<w:rPr/>",
+            extra_styles='<w:style w:styleId="Title"><w:rPr>'
+                         '<w:rFonts w:ascii="Trebuchet MS"/></w:rPr></w:style>',
+        )
+
+        after, changed = clean_redline.normalize_default_font(before)
+
+        self.assertEqual(changed, 0)
+        self.assertIn('w:ascii="Trebuchet MS"', after.decode())
+
+    def test_preserves_unused_namespace_declarations_and_mc_ignorable(self):
+        """The reason this rule edits text instead of round-tripping ElementTree.
+
+        styles.xml declares prefixes no element happens to use and names them in
+        mc:Ignorable. Re-serializing drops those declarations while mc:Ignorable still
+        references them, and that is what makes Word offer to repair the file.
+        """
+        before = self._styles(
+            self.FONTS.format("Times New Roman"),
+            root_attrs=f' xmlns:w15="{clean_redline.NAMESPACES["w15"]}"'
+                       ' mc:Ignorable="w15"',
+        )
+
+        after, changed = clean_redline.normalize_default_font(before)
+
+        self.assertEqual(changed, 1)
+        text = after.decode()
+        self.assertIn('xmlns:w15=', text)
+        self.assertIn('mc:Ignorable="w15"', text)
+        # Everything outside the one rFonts tag is byte-identical.
+        self.assertEqual(
+            before.decode().replace('"Times New Roman"', '"Arial"'), text
+        )
+
+    def test_default_font_repair_is_idempotent(self):
+        once, _ = clean_redline.normalize_default_font(
+            self._styles(self.FONTS.format("Times New Roman"))
+        )
+
+        twice, changed = clean_redline.normalize_default_font(once)
+
+        self.assertEqual(changed, 0)
+        self.assertEqual(twice, once)
+
+    def test_fails_closed_on_a_stylesheet_that_will_not_parse(self):
+        broken = b'<w:styles><w:rPrDefault><w:rPr><w:rFonts w:ascii="Times New Roman"/>'
+
+        after, changed = clean_redline.normalize_default_font(broken)
+
+        self.assertEqual((after, changed), (broken, 0))
+
+
+class InsertedListNumberPrefixTests(unittest.TestCase):
+    """The original auto-numbered its headings; the revision has the number as typed text."""
+
+    HEADING = "<w:r><w:t>Services</w:t></w:r>"
+    NUMBER_INS = '<w:ins w:id="1"><w:r><w:t xml:space="preserve">1.  </w:t></w:r></w:ins>'
+
+    def _para(self, body=None, pPr=""):
+        inner = body if body is not None else (self.NUMBER_INS + self.HEADING)
+        return _document(f"<w:p><w:pPr>{pPr}</w:pPr>{inner}</w:p>")
+
+    def test_accepts_the_inserted_section_number(self):
+        root = self._para()
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 1)
+        self.assertEqual(root.findall(f".//{W}ins"), [])
+        # The number survives as plain text, so the heading is still numbered.
+        self.assertEqual("".join(root.itertext()).strip(), "1.  Services".strip())
+
+    def test_accepting_the_number_is_idempotent(self):
+        root = self._para()
+        clean_redline.clean_inserted_list_number_prefixes(root)
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
+
+    def test_keeps_a_genuine_renumber(self):
+        """A real renumber pairs the insertion with a deletion of the old number."""
+        root = self._para(
+            body='<w:ins w:id="1"><w:r><w:t>2. </w:t></w:r></w:ins>'
+                 '<w:del w:id="2"><w:r><w:delText>1. </w:delText></w:r></w:del>'
+                 + self.HEADING
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
+
+    def test_keeps_a_paragraph_that_still_has_its_own_numbering(self):
+        """With numPr intact the literal number is a duplicate, not a replacement."""
+        root = self._para(
+            pPr='<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>'
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
+
+    def test_ignores_an_inserted_figure_mid_sentence(self):
+        """"$40,000" is not a section number, and it is not the first thing in the paragraph."""
+        root = self._para(
+            body='<w:r><w:t>$</w:t></w:r>'
+                 '<w:ins w:id="1"><w:r><w:t>40</w:t></w:r></w:ins>'
+                 '<w:r><w:t>,000 payable on signing.</w:t></w:r>'
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
+
+    def test_requires_a_trailing_period_on_the_number(self):
+        root = self._para(
+            body='<w:ins w:id="1"><w:r><w:t>40 </w:t></w:r></w:ins>' + self.HEADING
+        )
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
+
+    def test_requires_a_heading_after_the_number(self):
+        """Coast's 14th heading has its number alone in a paragraph beside a deletion."""
+        root = self._para(body=self.NUMBER_INS)
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
+
+    def test_requires_the_insertion_to_come_first(self):
+        root = self._para(body=self.HEADING + self.NUMBER_INS)
+
+        self.assertEqual(clean_redline.clean_inserted_list_number_prefixes(root), 0)
 
 
 if __name__ == "__main__":
