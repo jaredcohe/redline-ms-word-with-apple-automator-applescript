@@ -175,6 +175,7 @@ RPR_ORDER = (
 # 1.15 line spacing = spacing line="276" lineRule="auto" (240 * 1.15).
 BODY_FONT_HALF_PT = "20"
 BODY_LINE = "276"
+BODY_FONT = "Arial"
 NON_BODY_STYLES = {"Title", "Subtitle"}
 
 # Space kept above the document title when the leading spacer paragraphs are removed
@@ -1168,6 +1169,12 @@ def clean_cosmetic_section_breaks(root: ET.Element) -> int:
     section — i.e. it is a purely cosmetic page break, not a landscape/differently-sized
     section. The body-level <w:sectPr> (whole-document page setup) is never removed.
 
+    Only pgSz is compared, never pgMar: a converter emits a section per page, each with its own
+    slightly different top margin as it tries to reproduce the PDF's page positions (Applied
+    Systems' return carried 1180/1080/1280/1360 against a body-level 1080). Levelling those to
+    the body-level margin is the desired outcome, so differing margins must not block the rule.
+    A genuinely different *page* — landscape, or another paper size — is what pgSz protects.
+
     The paragraph that *hosted* such a break is almost always an empty one the revised file
     used as a break carrier, and leaving it behind shows up as a stray blank line above the
     next heading. So the host paragraph is deleted too, but only when it is a pure spacer
@@ -1217,11 +1224,15 @@ def clean_leading_empty_paragraphs(root: ET.Element) -> int:
     adopts the revised file's spacers untracked while keeping the original's, so the title
     drifts down the page by a blank line or two.
 
-    Every pure spacer between the last content-bearing paragraph and the first paragraph with
-    text is removed, and the gap they provided is folded back onto that content paragraph as
-    pPr/spacing/@w:after — the largest explicit `after` among the removed spacers, or
-    TITLE_GAP_AFTER. The logo paragraph itself holds a <w:drawing>, so it is not contentless
-    and bounds the scan instead of being deleted.
+    The artifact is therefore *stacked duplicates*, so the fix is to de-duplicate: every pure
+    spacer but the last is removed, and the survivor (the one adjacent to the title) provides
+    the gap. That is visually neutral by construction, which folding a gap was not — the old
+    behaviour replaced the removed spacers with a hardcoded TITLE_GAP_AFTER, and that only
+    ever matched one letterhead. On a document with a single legitimate spacer above the
+    title it pulled the title up the page; now the rule simply does not fire.
+
+    The logo paragraph itself holds a <w:drawing>, so it is not contentless and bounds the
+    scan instead of being deleted.
     """
     body = root.find(W + "body")
     if body is None:
@@ -1245,18 +1256,116 @@ def clean_leading_empty_paragraphs(root: ET.Element) -> int:
         return 0
 
     spacers = children[start:first_text_index]
-    following = children[first_text_index]
-    previous = children[start - 1] if start > 0 else None
+    if len(spacers) < 2:
+        return 0  # a single spacer is the document's own gap, not a duplicate
 
-    gap = _spacer_gap(spacers)
-
-    for spacer in spacers:
-        relocate_bookmarks(spacer, following)
+    # Keep the last — it sits against the title and carries the intended gap.
+    survivor = spacers[-1]
+    for spacer in spacers[:-1]:
+        relocate_bookmarks(spacer, survivor)
         body.remove(spacer)
 
-    _fold_gap_after(previous, gap, keep_larger=False)
+    return len(spacers) - 1
 
-    return len(spacers)
+
+def _is_text_free_paragraph(p: ET.Element) -> bool:
+    """No text either way, and nothing that a mark revision could be standing in for.
+
+    Looser than _is_contentless_paragraph in exactly one respect — a <w:drawing> is allowed,
+    so the letterhead logo qualifies — and every other protection is kept, because loosening
+    those is what would make clean_blank_paragraph_mark_deletions unsafe. A comment anchor, a
+    field, an SDT or any *content* revision disqualifies the paragraph.
+    """
+    if p.tag != W + "p":
+        return False
+    if norm(visible_text(p)) or norm("".join(iter_text(p, DEL_TEXT))):
+        return False
+    mark_rPr = paragraph_mark_rPr(p)
+    mark_revisions = {id(child) for child in mark_rPr} if mark_rPr is not None else set()
+    for node in p.iter():
+        if node.tag in {INS, DEL} and id(node) not in mark_revisions:
+            return False
+    blocking = PROTECTED_TAGS - BOOKMARK_TAGS - {W + "drawing"}
+    return not any(node.tag in blocking for node in p.iter())
+
+
+def clean_blank_paragraph_mark_deletions(root: ET.Element) -> int:
+    """Untrack a deleted paragraph mark on a paragraph that holds no text.
+
+    The mirror of clean_inserted_spacer_paragraphs. Which document holds the surplus spacers
+    decides the direction the artifact arrives in: when the *revised* file has them they come
+    as inserted marks, and when the *original* does they come as deleted marks. The Applied
+    Systems letter is the second case — a change bar on the letterhead logo and five more on
+    blank lines, one of them immediately above a section heading.
+
+    Only the <w:del> inside the mark's own pPr/rPr is removed, and the paragraph stays. That
+    element holds no runs and no text, so this cannot remove content; what it costs is that
+    Accept All no longer collapses the blank line, which is layout, not text. Keeping the
+    paragraph is why this is safe to do to a *deletion* at all — nothing authored is
+    pre-empted, and a blank line's existence is not a term of the contract.
+
+    A deleted mark on a paragraph that *has* text is left alone: there it means the paragraph
+    break itself was deleted, which is a real structural edit and often the thing that
+    rejoins a sentence a conversion split.
+
+    A blank whose *preceding* sibling also carries a deleted mark is skipped, because
+    consecutive deleted marks form a merge chain: each one says "this break goes", so
+    accepting the run rejoins everything in it into a single paragraph. Applied Systems'
+    letter has exactly that — a sentence split by an inline footer, as
+    "…do not apply to" / blank / "ID:0" / blank / "any other role…", where the five deleted
+    marks are what put the sentence back together. Untracking a mark in the middle would
+    break the chain and leave the sentence split across paragraphs for good.
+
+    This also reaches the spacer that hosted a cosmetic section break, which
+    clean_cosmetic_section_breaks deliberately spares *because* its mark is deleted. That rule
+    only ever revisits a paragraph while it still carries a <w:sectPr>, so untracking the mark
+    afterwards does not let it be deleted — the paragraph still stands, it just stops drawing
+    a change bar on an empty line.
+    """
+    changed = 0
+    for parent in _paragraph_parents(root):
+        previous_mark = None
+        for p in [child for child in parent if child.tag == W + "p"]:
+            mark = paragraph_mark_revision(p)
+            if mark == DEL and previous_mark != DEL and _is_text_free_paragraph(p):
+                mark_rPr = paragraph_mark_rPr(p)
+                mark_rPr.remove(mark_rPr.find(DEL))
+                changed += 1
+                previous_mark = None
+            else:
+                previous_mark = mark
+    return changed
+
+
+def normalize_section_margins(root: ET.Element) -> int:
+    """Repair a bottom page margin a converter set smaller than its own footer distance.
+
+    Applied Systems' converted return carries pgMar/@w:bottom="280" (0.19") against a top of
+    1080 and a footer distance of 720 in all five of its sections, so body text runs under the
+    footer. Because a redline inherits the revised document's section properties, the defect
+    propagates into every redline built on that chain.
+
+    Both conditions are required — bottom smaller than top *and* smaller than the footer
+    distance — so a deliberately asymmetric page setup is left alone. A bottom margin inside
+    the footer distance is never intentional. The document's own top margin supplies the
+    replacement, so no template value is hardcoded (ours disagree: 1152 and 1440).
+    """
+    changed = 0
+    for sect in root.iter(W + "sectPr"):
+        pgMar = sect.find(W + "pgMar")
+        if pgMar is None:
+            continue
+        top, bottom, footer = (pgMar.get(W + k) for k in ("top", "bottom", "footer"))
+        if not (top and bottom and footer):
+            continue
+        try:
+            top_v, bottom_v, footer_v = int(top), int(bottom), int(footer)
+        except ValueError:
+            continue
+        if bottom_v < top_v and bottom_v < footer_v:
+            pgMar.set(W + "bottom", top)
+            changed += 1
+    return changed
 
 
 def _spacer_gap(spacers: list[ET.Element]) -> str:
@@ -1466,6 +1575,66 @@ def clean_orphaned_list_number_deletions(root: ET.Element) -> int:
             continue  # nothing but the number: no heading to keep it for
         index = list(p).index(del_elem)
         p[index: index + 1] = del_to_unchanged_runs(del_elem)
+        changed += 1
+    return changed
+
+
+def clean_inserted_list_number_prefixes(root: ET.Element) -> int:
+    """Accept the literal section number a flattened revision adds to a heading.
+
+    The insertion-direction mirror of clean_orphaned_list_number_deletions, and the third
+    shape this artifact takes. Here the *original* auto-numbered its headings with numPr
+    while the revision carries the number as typed text, so Compare sees "Services" become
+    "1. Services" and correctly reports "1. " as new text. Coast's letter does this on 13 of
+    14 headings: thirteen inserted numbers representing no substantive change at all, which
+    is exactly the "I'm not sure what change it's even showing" complaint — the words did not
+    move, only the mechanism that produces the number.
+
+    Resolved by accepting the insertion rather than dropping it. Dropping would leave the
+    heading with no number at all, because the paragraph has lost its numPr too — the same
+    trap that made an unnumbered agreement out of the Nooks letter. Accepting keeps
+    "1. Services" on the page as plain text and takes the change bar away.
+
+    The guards mirror the deletion-direction rule, and each one excludes a real edit:
+
+    - the <w:ins> is the paragraph's first content child, so a figure mid-sentence is out
+    - its text is a bare number **ending in a period** ("$40,000" cannot match)
+    - the paragraph has no numPr — with one, the literal number really is a duplicate and
+      clean_phantom_list_number_paragraphs owns the case
+    - the paragraph holds no <w:del> anywhere: a genuine renumber replaces one number with
+      another, so its insertion is always paired with a deletion
+    - unchanged text still follows, so there is a heading for the number to belong to
+
+    Those last two are what spare the one heading in Coast's letter that does not fit this
+    shape: its "14. " insertion sits in a paragraph of its own alongside a deletion, which is
+    a real restructure and stays visible.
+    """
+    changed = 0
+    for p in root.iter(W + "p"):
+        if p.find(".//" + DEL) is not None:
+            continue
+        pPr = p.find(W + "pPr")
+        if pPr is not None and pPr.find(W + "numPr") is not None:
+            continue
+        content = [
+            child for child in p
+            if child.tag != W + "pPr" and child.tag not in BOOKMARK_TAGS
+        ]
+        if not content or content[0].tag != INS:
+            continue
+        ins = content[0]
+        if any(node.tag in (PROTECTED_TAGS - BOOKMARK_TAGS) for node in ins.iter()):
+            continue
+        if not SECTION_NUMBER_RE.match(norm("".join(iter_text(ins, TEXT)))):
+            continue
+        inserted = {id(node) for node in ins.iter(TEXT)}
+        unchanged = "".join(
+            node.text or "" for node in p.iter(TEXT) if id(node) not in inserted
+        )
+        if not norm(unchanged):
+            continue  # nothing but the number: no heading to keep it for
+        index = list(p).index(ins)
+        p[index: index + 1] = accepted_children(ins)
         changed += 1
     return changed
 
@@ -1762,6 +1931,7 @@ def clean_conversion_paragraph_splits(root: ET.Element) -> int:
 
 
 DOCUMENT_PART = "word/document.xml"
+STYLES_PART = "word/styles.xml"
 
 
 def clean_header_footer_relocations(
@@ -1774,10 +1944,17 @@ def clean_header_footer_relocations(
     the same string shows up as an insertion in the middle of the body, which is how a footer
     ends up printed mid-paragraph in the redline.
 
-    Match a header/footer paragraph whose only revision is a DEL against a body paragraph
-    whose only revision is an INS of the same text (whitespace-insensitive): restore the
-    header/footer del in place and delete the body insertion. Returns the change count per
-    part so the caller knows which parts to rewrite.
+    Both directions occur, depending on which file was flattened. When the *original* had the
+    furniture inline, Compare marks the header/footer copy inserted and the body copy deleted
+    — Applied Systems' letter does exactly that with its "ID:0" tag, and the inline copy sits
+    mid-sentence, splitting a paragraph in two.
+
+    So match a header/footer paragraph whose only revision is a DEL or an INS against a body
+    paragraph whose only revision is the opposite, of the same text (whitespace-insensitive).
+    Either way the resolution is the same shape: the text becomes unchanged in the
+    header/footer, where it belongs, and its revision in the body is dropped. Nothing is lost
+    — the words survive in the header/footer part. Returns the change count per part so the
+    caller knows which parts to rewrite.
     """
     body = doc_root.find(W + "body")
     if body is None:
@@ -1790,24 +1967,30 @@ def clean_header_footer_relocations(
     for name, hf_root in hf_roots.items():
         for hf_p in list(hf_root.iter(W + "p")):
             found = _sole_text_revision(hf_p)
-            if found is None or found[0] != DEL:
+            if found is None or found[0] not in {DEL, INS}:
                 continue
-            _, del_text, del_revision = found
+            hf_kind, hf_text, hf_revision = found
+            body_kind = INS if hf_kind == DEL else DEL
 
             match = None
             for body_p in candidates:
                 payload = _sole_text_revision(body_p)
-                if payload is None or payload[0] != INS:
+                if payload is None or payload[0] != body_kind:
                     continue
-                if same_text_or_spacing_only(del_text, payload[1]):
+                if same_text_or_spacing_only(hf_text, payload[1]):
                     match = (body_p, payload[2])
                     break
             if match is None:
                 continue
 
-            body_p, ins_revision = match
-            replace_descendant(hf_p, del_revision, del_to_unchanged_runs(del_revision))
-            replace_descendant(body_p, ins_revision, [])
+            body_p, body_revision = match
+            # Restoring a del and accepting an ins both leave plain unchanged runs behind.
+            resolved = (
+                del_to_unchanged_runs(hf_revision) if hf_kind == DEL
+                else accepted_children(hf_revision)
+            )
+            replace_descendant(hf_p, hf_revision, resolved)
+            replace_descendant(body_p, body_revision, [])
             counts[name] = counts.get(name, 0) + 1
             counts[DOCUMENT_PART] = (
                 counts.get(DOCUMENT_PART, 0) + 1 + _drop_emptied_container(body_p, parents)
@@ -2037,11 +2220,13 @@ def clean_root(root: ET.Element) -> int:
             + clean_empty_list_paragraphs(root)
             + clean_phantom_list_number_paragraphs(root)
             + clean_orphaned_list_number_deletions(root)
+            + clean_inserted_list_number_prefixes(root)
             + clean_image_revisions(root)
             + clean_relocated_table_noops(root)
             + clean_cosmetic_section_breaks(root)
             + clean_leading_empty_paragraphs(root)
             + clean_logo_spacer_mark_swap(root)
+            + clean_blank_paragraph_mark_deletions(root)
             + clean_inserted_spacer_paragraphs(root)
             + clean_conversion_paragraph_splits(root)
         )
@@ -2055,6 +2240,7 @@ def clean_document_xml(xml_bytes: bytes) -> tuple[bytes, int]:
     root = ET.fromstring(xml_bytes)
     changed = clean_root(root)
     changed += normalize_body_formatting(root)
+    changed += normalize_section_margins(root)
     # Last: removing revisions orphans the prefixes they used (e.g. w16du:dateUtc), and
     # pruning before the loop would leave them behind for a second run to notice.
     changed += clean_ignorable_namespaces(root)
@@ -2092,6 +2278,8 @@ def clean_docx_parts(parts: dict[str, bytes]) -> dict[str, tuple[bytes, int]]:
     result: dict[str, tuple[bytes, int]] = {}
     for name, root in roots.items():
         counts[name] += normalize_body_formatting(root)
+        if name == DOCUMENT_PART:
+            counts[name] += normalize_section_margins(root)
         # Last, once every revision that referenced a prefix is gone — see clean_document_xml.
         counts[name] += clean_ignorable_namespaces(root)
         result[name] = (
@@ -2227,6 +2415,70 @@ def prune_orphaned_media(parts: dict[str, bytes]) -> tuple[dict[str, bytes], set
     return rewritten, dropped, removed_rels + len(dropped)
 
 
+def normalize_default_font(styles_bytes: bytes) -> tuple[bytes, int]:
+    """Point the stylesheet's default font back at the house font.
+
+    Word Compare adopts the *revised* document's styles.xml and theme wholesale, so a
+    counterparty whose own default is Times New Roman silently reflows every paragraph that
+    does not name a font of its own. SentiLink's return does exactly that. Because no run in
+    these letters carries an explicit rFonts, the two paragraphs that came through with NU's
+    `Normal` style switched from Arial to Times New Roman — the style *name* survived, but the
+    stylesheet behind it is now the counterparty's.
+
+    Only docDefaults/rPrDefault/rPr/rFonts is touched, and only the ascii/hAnsi/cs attributes
+    that are present and disagree. Absent attributes are not created, and an absent rFonts
+    means the theme supplies the font, so it is left alone — that keeps the corpus documents
+    with no docDefaults font (they take Arial from their `Normal` style) untouched. eastAsia
+    is left as-is: it only affects CJK text these contracts never contain. A style or run
+    naming its own font still wins, so Title stays Trebuchet MS and a counterparty's own
+    Arial `Body` is untouched; the change lands exactly on the inheriting paragraphs.
+
+    Applied as a scoped text edit rather than an ElementTree round-trip, deliberately.
+    styles.xml declares a dozen namespace prefixes and names most of them in mc:Ignorable,
+    but ET emits only the declarations some element actually uses. Re-serializing would drop
+    the rest while mc:Ignorable still referenced them, and an mc:Ignorable naming an
+    undeclared prefix is what makes Word offer to repair the file. So every other byte is
+    left exactly as it was.
+    """
+    try:
+        text = styles_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return styles_bytes, 0
+
+    start = text.find("<w:rPrDefault")
+    if start == -1:
+        return styles_bytes, 0
+    end = text.find("</w:rPrDefault>", start)
+    if end == -1:
+        return styles_bytes, 0
+
+    block = text[start:end]
+    found = re.search(r"<w:rFonts\b[^>]*>", block)
+    if found is None:
+        return styles_bytes, 0  # no default font declared; the theme supplies it
+
+    tag = found.group(0)
+    updated_tag = tag
+    for attribute in ("ascii", "hAnsi", "cs"):
+        # The lookahead leaves an already-correct value alone, which is what makes this
+        # idempotent — the workflow runs the cleaner twice per redline.
+        updated_tag = re.sub(
+            r'(w:%s=")(?!%s")[^"]*(")' % (attribute, re.escape(BODY_FONT)),
+            r"\1" + BODY_FONT + r"\2",
+            updated_tag,
+        )
+    if updated_tag == tag:
+        return styles_bytes, 0
+
+    updated = text[:start] + block.replace(tag, updated_tag, 1) + text[end:]
+    result = updated.encode("utf-8")
+    try:
+        ET.fromstring(result)
+    except ET.ParseError:
+        return styles_bytes, 0  # fail closed: never write a stylesheet we just broke
+    return result, 1
+
+
 def rewrite_docx(path: Path) -> int:
     with ZipFile(path, "r") as zin:
         infos = zin.infolist()
@@ -2247,6 +2499,15 @@ def rewrite_docx(path: Path) -> int:
         rewritten_rels, dropped, pruned = prune_orphaned_media(effective)
         cleaned_parts.update(rewritten_rels)
         changed += pruned
+
+        # styles.xml is not a CLEANABLE_PART: it holds no <w:body> and no paragraphs, so the
+        # body rules have nothing to do there. Only its default font needs repairing.
+        styles = all_parts.get(STYLES_PART)
+        if styles is not None:
+            styles_data, font_fixed = normalize_default_font(styles)
+            if font_fixed:
+                cleaned_parts[STYLES_PART] = styles_data
+                changed += font_fixed
 
         if changed == 0:
             return 0
